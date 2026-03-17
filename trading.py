@@ -1,8 +1,45 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
-from typing import List
+from typing import List, Optional
 
-FAIR_VALUE = 10000
-POSITION_LIMIT = 40  # max units long or short
+EMERALD_FAIR_VALUE = 10000
+POSITION_LIMIT = 80  # max units long or short
+MIDWALL_TOP_N = 3    # number of highest-volume levels to use per side
+
+
+def midwall(order_depth: OrderDepth, top_n: int = MIDWALL_TOP_N) -> Optional[float]:
+    """
+    Estimate fair value from the deepest (highest-volume) quotes on each side.
+
+    For each side, pick the top_n levels by volume and compute their
+    volume-weighted average price (the "wall"). Fair value is the mean of
+    the bid-wall and ask-wall prices.
+    """
+    def wall_price(levels: dict) -> Optional[float]:
+        if not levels:
+            return None
+        # Sort by absolute volume descending, take the heaviest top_n levels
+        top = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
+        total_vol = sum(abs(v) for _, v in top)
+        if total_vol == 0:
+            return None
+        return sum(p * abs(v) for p, v in top) / total_vol
+
+    bid_wall = wall_price(order_depth.buy_orders)
+    ask_wall = wall_price(order_depth.sell_orders)
+
+    if bid_wall is None and ask_wall is None:
+        return None
+    if bid_wall is None:
+        return ask_wall
+    if ask_wall is None:
+        return bid_wall
+    return (bid_wall + ask_wall) / 2
+
+
+def fair_value(product: str, order_depth: OrderDepth) -> Optional[float]:
+    if product == "EMERALDS":
+        return EMERALD_FAIR_VALUE
+    return midwall(order_depth)
 
 
 class Trader:
@@ -14,6 +51,13 @@ class Trader:
             orders: List[Order] = []
             position = state.position.get(product, 0)
 
+            fv = fair_value(product, order_depth)
+            if fv is None:
+                result[product] = orders
+                continue
+
+            print(f"FAIR VALUE {product}: {fv:.2f}")
+
             # How much capacity we have left on each side
             buy_capacity  = POSITION_LIMIT - position   # max we can still buy
             sell_capacity = POSITION_LIMIT + position   # max we can still sell
@@ -21,7 +65,7 @@ class Trader:
             # ── Step 1: Take profitable quotes already on the book ────────────
             # Buy every ask that is priced below fair value
             for ask_price in sorted(order_depth.sell_orders.keys()):
-                if ask_price >= FAIR_VALUE:
+                if ask_price >= fv:
                     break
                 if buy_capacity <= 0:
                     break
@@ -33,7 +77,7 @@ class Trader:
 
             # Sell every bid that is priced above fair value
             for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                if bid_price <= FAIR_VALUE:
+                if bid_price <= fv:
                     break
                 if sell_capacity <= 0:
                     break
@@ -49,7 +93,7 @@ class Trader:
                 best_bid = max(order_depth.buy_orders.keys())
                 our_bid  = best_bid + 1
                 # Don't quote above fair value
-                if our_bid < FAIR_VALUE:
+                if our_bid < fv:
                     orders.append(Order(product, our_bid, buy_capacity))
                     print(f"QUOTE BID {buy_capacity}x {product} @ {our_bid}")
 
@@ -58,7 +102,7 @@ class Trader:
                 best_ask = min(order_depth.sell_orders.keys())
                 our_ask  = best_ask - 1
                 # Don't quote below fair value
-                if our_ask > FAIR_VALUE:
+                if our_ask > fv:
                     orders.append(Order(product, our_ask, -sell_capacity))
                     print(f"QUOTE ASK {sell_capacity}x {product} @ {our_ask}")
 
