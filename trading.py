@@ -4,6 +4,7 @@ from typing import List, Optional
 EMERALD_FAIR_VALUE = 10000
 POSITION_LIMIT = 80  # max units long or short
 MIDWALL_TOP_N = 3    # number of highest-volume levels to use per side
+EMERALD_SKEW_THRESHOLD = 55  # if |position| exceeds this, trade at fair value to revert
 
 
 def midwall(order_depth: OrderDepth, top_n: int = MIDWALL_TOP_N) -> Optional[float]:
@@ -88,23 +89,35 @@ class Trader:
                 print(f"TAKE SELL {qty}x {product} @ {bid_price}")
 
             # ── Step 2: Post quotes a tick better than the current best ───────
-            # Our bid: 1 tick above the current best bid (beat the queue)
-            if order_depth.buy_orders and buy_capacity > 0:
-                best_bid = max(order_depth.buy_orders.keys())
-                our_bid  = best_bid + 1
-                # Don't quote above fair value
-                if our_bid < fv:
-                    orders.append(Order(product, our_bid, buy_capacity))
-                    print(f"QUOTE BID {buy_capacity}x {product} @ {our_bid}")
+            # For EMERALDS, if inventory is too skewed, post directly at fair value
+            # to encourage reversion before doing normal quote logic.
+            if product == "EMERALDS" and abs(position) > EMERALD_SKEW_THRESHOLD:
+                if position > 0 and sell_capacity > 0:
+                    # Too long — offer to sell at fair value
+                    orders.append(Order(product, EMERALD_FAIR_VALUE, -sell_capacity))
+                    print(f"SKEW ASK  {sell_capacity}x {product} @ {EMERALD_FAIR_VALUE} (pos={position})")
+                elif position < 0 and buy_capacity > 0:
+                    # Too short — bid at fair value
+                    orders.append(Order(product, EMERALD_FAIR_VALUE, buy_capacity))
+                    print(f"SKEW BID  {buy_capacity}x {product} @ {EMERALD_FAIR_VALUE} (pos={position})")
+            else:
+                # Our bid: 1 tick above the current best bid (beat the queue)
+                if order_depth.buy_orders and buy_capacity > 0:
+                    best_bid = max(order_depth.buy_orders.keys())
+                    our_bid  = best_bid + 1
+                    # Don't quote above fair value
+                    if our_bid < fv:
+                        orders.append(Order(product, our_bid, buy_capacity))
+                        print(f"QUOTE BID {buy_capacity}x {product} @ {our_bid}")
 
-            # Our ask: 1 tick below the current best ask (beat the queue)
-            if order_depth.sell_orders and sell_capacity > 0:
-                best_ask = min(order_depth.sell_orders.keys())
-                our_ask  = best_ask - 1
-                # Don't quote below fair value
-                if our_ask > fv:
-                    orders.append(Order(product, our_ask, -sell_capacity))
-                    print(f"QUOTE ASK {sell_capacity}x {product} @ {our_ask}")
+                # Our ask: 1 tick below the current best ask (beat the queue)
+                if order_depth.sell_orders and sell_capacity > 0:
+                    best_ask = min(order_depth.sell_orders.keys())
+                    our_ask  = best_ask - 1
+                    # Don't quote below fair value
+                    if our_ask > fv:
+                        orders.append(Order(product, our_ask, -sell_capacity))
+                        print(f"QUOTE ASK {sell_capacity}x {product} @ {our_ask}")
 
             result[product] = orders
 
