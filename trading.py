@@ -1,159 +1,183 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Optional
 
-POSITION_LIMIT = 80   # max units long or short
-MIDWALL_TOP_N = 3     # number of highest-volume levels to use per side
-
-# Per-product skew thresholds: if |position| exceeds the value, post at fair value to revert.
-# Products not listed here fall back to DEFAULT_SKEW_THRESHOLD.
-DEFAULT_SKEW_THRESHOLD = 40
-SKEW_THRESHOLDS: dict[str, int] = {
-    "EMERALDS": 68,
-    "TOMATOES": 30,
+EMERALD_FAIR_VALUE = 10000
+# Updated based on prompt: 80 for both EMERALDS and TOMATOES
+POSITION_LIMITS = {
+    "EMERALDS": 80,
+    "TOMATOES": 80
 }
-
-
-def midwall(order_depth: OrderDepth, top_n: int = MIDWALL_TOP_N) -> Optional[float]:
-    """
-    Wall Mid: the average of the bid wall and ask wall prices.
-
-    The walls are the price levels with the deepest liquidity on each side,
-    identified by finding the level with the highest volume. These walls
-    represent where designated market makers quote, and their average provides
-    a stable, low-noise estimate of the true underlying price.
-    """
-    def wall_price(levels: dict) -> Optional[float]:
-        if not levels:
-            return None
-        # Find the single price level with the highest volume (the wall)
-        max_level = max(levels.items(), key=lambda x: abs(x[1]))
-        return max_level[0]
-
-    bid_wall = wall_price(order_depth.buy_orders)
-    ask_wall = wall_price(order_depth.sell_orders)
-
-    if bid_wall is None and ask_wall is None:
-        return None
-    if bid_wall is None:
-        return ask_wall
-    if ask_wall is None:
-        return bid_wall
-    return (bid_wall + ask_wall) / 2
-
-
-def fair_value(order_depth: OrderDepth) -> Optional[float]:
-    return midwall(order_depth)
+DEFAULT_LIMIT = 80
+MIDWALL_TOP_N = 3    # number of highest-volume levels to use per side
 
 
 class Trader:
 
+    def midwall(self, order_depth: OrderDepth, top_n: int = MIDWALL_TOP_N) -> Optional[float]:
+        """
+        Estimate fair value from the deepest (highest-volume) quotes on each side.
+        """
+        def wall_price(levels: dict) -> Optional[float]:
+            if not levels:
+                return None
+            # Sort by absolute volume descending, take the heaviest top_n levels
+            top = sorted(levels.items(), key=lambda x: abs(
+                x[1]), reverse=True)[:top_n]
+            total_vol = sum(abs(v) for _, v in top)
+            if total_vol == 0:
+                return None
+            return sum(p * abs(v) for p, v in top) / total_vol
+
+        bid_wall = wall_price(order_depth.buy_orders)
+        ask_wall = wall_price(order_depth.sell_orders)
+
+        if bid_wall is None and ask_wall is None:
+            return None
+        if bid_wall is None:
+            return ask_wall
+        if ask_wall is None:
+            return bid_wall
+
+        return (bid_wall + ask_wall) / 2
+
+    def get_fair_value(self, product: str, order_depth: OrderDepth, position: int) -> Optional[float]:
+        if product == "EMERALDS":
+            fv = EMERALD_FAIR_VALUE
+        else:
+            # TOMATOES and others use Midwall
+            fv = self.midwall(order_depth)
+
+        if fv is None:
+            return None
+
+        # ── Inventory Skew Optimization ───────────────────────────────────────
+        # Adjust fair value based on current position to mean-revert.
+
+        # With larger position limits (80), we can absorb more inventory.
+        # But we still want to clear inventory when skewed heavily.
+        skew_factor = 0.0
+
+        if product == "EMERALDS":
+            # Stable product.
+            if abs(position) < 40:
+                skew_factor = 0.0   # Pure Market Making
+            elif abs(position) < 60:
+                skew_factor = 0.05  # Moderate Inventory Management
+            else:
+                skew_factor = 0.2   # Aggressive Dumping/Covering
+        elif product == "TOMATOES":
+            # Volatile. 0.1 * 80 -> 8 ticks.
+            skew_factor = 0.1
+
+        fv_adj = fv - (skew_factor * position)
+        return fv_adj
+
     def run(self, state: TradingState):
         result = {}
 
-        for product, order_depth in state.order_depths.items():
+        for product in state.order_depths:
+            order_depth: OrderDepth = state.order_depths[product]
             orders: List[Order] = []
-            position = state.position.get(product, 0)
 
-            fv = fair_value(order_depth)
+            # 1. Get current position and limit
+            position = state.position.get(product, 0)
+            # Default to 80 if product not generic
+            limit = POSITION_LIMITS.get(product, DEFAULT_LIMIT)
+
+            # 2. Calculate Fair Value
+            fv = self.get_fair_value(product, order_depth, position)
             if fv is None:
                 result[product] = orders
                 continue
 
-            print(f"FAIR VALUE {product}: {fv:.2f}")
+            # 3. Calculate Trading Capacity
+            buy_capacity = limit - position
+            sell_capacity = limit + position
 
-            # How much capacity we have left on each side
-            buy_capacity  = POSITION_LIMIT - position   # max we can still buy
-            sell_capacity = POSITION_LIMIT + position   # max we can still sell
+            # ── Step 1: Taking (Aggressive) ───────────────────────────────────
+            # Buy any asks < FV
+            if len(order_depth.sell_orders) != 0:
+                best_asks = sorted(order_depth.sell_orders.keys())
+                for ask_price in best_asks:
+                    if ask_price > fv:
+                        break  # Asks are sorted asc, so we can stop
 
-            # ── Step 1: Take profitable quotes already on the book ────────────
-            # Buy every ask that is strictly below fair value (no loss)
-            for ask_price in sorted(order_depth.sell_orders.keys()):
-                if ask_price >= fv:
-                    break
-                if buy_capacity <= 0:
-                    break
-                available = -order_depth.sell_orders[ask_price]  # stored negative
-                qty = min(available, buy_capacity)
-                # Validate we're not taking at a loss
-                if ask_price < fv:
-                    orders.append(Order(product, ask_price, qty))
-                    buy_capacity -= qty
-                    print(f"TAKE BUY  {qty}x {product} @ {ask_price} (FV: {fv:.2f})")
-                else:
-                    print(f"REJECT BUY  @ {ask_price}: at/above FV {fv:.2f}")
+                    if buy_capacity <= 0:
+                        break
 
-            # Sell every bid that is strictly above fair value (no loss)
-            for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                if bid_price <= fv:
-                    break
-                if sell_capacity <= 0:
-                    break
-                available = order_depth.buy_orders[bid_price]
-                qty = min(available, sell_capacity)
-                # Validate we're not taking at a loss
-                if bid_price > fv:
-                    orders.append(Order(product, bid_price, -qty))
-                    sell_capacity -= qty
-                    print(f"TAKE SELL {qty}x {product} @ {bid_price} (FV: {fv:.2f})")
-                else:
-                    print(f"REJECT SELL @ {bid_price}: at/below FV {fv:.2f}")
+                    # Calculate quantity to take
+                    vol_at_price = abs(order_depth.sell_orders[ask_price])
+                    take_qty = min(buy_capacity, vol_at_price)
 
-            # ── Step 2: Post quotes a tick better than the current best ───────
-            # If inventory is too skewed, post at fair value (rounded) to revert,
-            # but only if rounding doesn't create a loss.
-            fv_int = int(round(fv))
-            skew_threshold = SKEW_THRESHOLDS.get(product, DEFAULT_SKEW_THRESHOLD)
-            if abs(position) > skew_threshold:
-                if position > 0 and sell_capacity > 0:
-                    # Too long — offer to sell. Use higher of (fv_int, fv) to avoid loss.
-                    sell_price = max(fv_int, int(fv))
-                    orders.append(Order(product, sell_price, -sell_capacity))
-                    print(f"SKEW ASK  {sell_capacity}x {product} @ {sell_price} (pos={position}, FV: {fv:.2f})")
-                elif position < 0 and buy_capacity > 0:
-                    # Too short — bid at fair value. Use lower of (fv_int, fv) to avoid loss.
-                    buy_price = min(fv_int, int(fv))
-                    orders.append(Order(product, buy_price, buy_capacity))
-                    print(f"SKEW BID  {buy_capacity}x {product} @ {buy_price} (pos={position}, FV: {fv:.2f})")
-            else:
-                best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-                best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
-                spread = (best_ask - best_bid) if (best_bid is not None and best_ask is not None) else None
+                    if take_qty > 0:
+                        orders.append(Order(product, ask_price, take_qty))
+                        buy_capacity -= take_qty
+                        # print(f"TAKE BUY {product} {take_qty} @ {ask_price} (FV {fv:.2f})")
 
-                # Aggressive quoting strategy
-                if spread is not None and spread < 3:
-                    # Tight spread: post at fair value with reduced size for higher fill rate
-                    fv_int = int(round(fv))
-                    qty_tight = max(1, buy_capacity // 2)  # post half size in tight spreads
+            # Sell any bids > FV
+            if len(order_depth.buy_orders) != 0:
+                best_bids = sorted(order_depth.buy_orders.keys(), reverse=True)
+                for bid_price in best_bids:
+                    if bid_price < fv:
+                        break  # Bids are sorted desc, so we can stop
 
-                    if buy_capacity > 0:
-                        orders.append(Order(product, fv_int, qty_tight))
-                        print(f"AGG BID {qty_tight}x {product} @ {fv_int} (tight spread={spread}, FV: {fv:.2f})")
+                    if sell_capacity <= 0:
+                        break
 
-                    if sell_capacity > 0:
-                        orders.append(Order(product, fv_int, -qty_tight))
-                        print(f"AGG ASK {qty_tight}x {product} @ {fv_int} (tight spread={spread}, FV: {fv:.2f})")
-                else:
-                    # Normal spread: post +1/-1 ticks from market with full capacity
-                    # Our bid: 1 tick above the current best bid (beat the queue)
-                    if best_bid is not None and buy_capacity > 0:
-                        our_bid = best_bid + 1
-                        if our_bid < fv:
-                            orders.append(Order(product, our_bid, buy_capacity))
-                            print(f"QUOTE BID {buy_capacity}x {product} @ {our_bid} (FV: {fv:.2f})")
-                        else:
-                            print(f"REJECT BID QUOTE @ {our_bid}: at/above FV {fv:.2f}")
+                    vol_at_price = order_depth.buy_orders[bid_price]
+                    take_qty = min(sell_capacity, vol_at_price)
 
-                    # Our ask: 1 tick below the current best ask (beat the queue)
-                    if best_ask is not None and sell_capacity > 0:
-                        our_ask = best_ask - 1
-                        if our_ask > fv:
-                            orders.append(Order(product, our_ask, -sell_capacity))
-                            print(f"QUOTE ASK {sell_capacity}x {product} @ {our_ask} (FV: {fv:.2f})")
-                        else:
-                            print(f"REJECT ASK QUOTE @ {our_ask}: at/below FV {fv:.2f}")
+                    if take_qty > 0:
+                        orders.append(Order(product, bid_price, -take_qty))
+                        sell_capacity -= take_qty
+                        # print(f"TAKE SELL {product} {take_qty} @ {bid_price} (FV {fv:.2f})")
+
+            # ── Step 2: Making (Passive) ─────────────────────────────────────
+            # Place limit orders to capture spread
+
+            # Quote Bid
+            if buy_capacity > 0:
+                best_bid = max(order_depth.buy_orders.keys()
+                               ) if order_depth.buy_orders else 0
+                best_ask = min(order_depth.sell_orders.keys()
+                               ) if order_depth.sell_orders else float('inf')
+
+                # Default: Improve best bid by 1
+                our_bid = best_bid + 1
+
+                # Check spread constraint: If spread is 1 tick, we can't improve without crossing.
+                # If best_ask - best_bid <= 1, our_bid (best_bid+1) >= best_ask.
+                # Since we already attempted to take at best_ask in Step 1 (if it was < FV),
+                # If we are here, best_ask >= FV.
+                # So if we quote at best_ask, we are bidding >= FV, which is bad (unless skewed).
+                # But logical check: We only quote if `our_bid < fv`.
+
+                # Special handling for tight spread: Join the queue instead of doing nothing?
+                if our_bid >= best_ask:
+                    our_bid = best_bid  # Join
+
+                if our_bid < fv:
+                    orders.append(Order(product, our_bid, buy_capacity))
+
+            # Quote Ask
+            if sell_capacity > 0:
+                best_ask = min(order_depth.sell_orders.keys()
+                               ) if order_depth.sell_orders else float('inf')
+                best_bid = max(order_depth.buy_orders.keys()
+                               ) if order_depth.buy_orders else 0
+
+                # Default: Undercut best ask by 1
+                our_ask = best_ask - 1
+
+                # Check spread constraint
+                if our_ask <= best_bid:
+                    our_ask = best_ask  # Join
+
+                if our_ask > fv:
+                    orders.append(Order(product, our_ask, -sell_capacity))
 
             result[product] = orders
 
-        traderData = ""
+        traderData = "OPTIMIZED_V3"
         conversions = 0
         return result, conversions, traderData
