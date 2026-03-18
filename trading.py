@@ -1,28 +1,30 @@
+import json
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Optional
 
 EMERALD_FAIR_VALUE = 10000
-# Updated based on prompt: 80 for both EMERALDS and TOMATOES
 POSITION_LIMITS = {
     "EMERALDS": 80,
     "TOMATOES": 80
 }
 DEFAULT_LIMIT = 80
-MIDWALL_TOP_N = 3    # number of highest-volume levels to use per side
+MIDWALL_TOP_N = 1
+
+# TOMATOES EMA parameters
+EMA_ALPHA = 0.08          # slow EMA to track drift (1 = fully current, 0 = no update)
+AC1_COEFF = 0.3           # fraction of last return to shade FV (exploits -0.44 AC1)
+IMBALANCE_COEFF = 2.0     # ticks of FV adjustment per unit of volume imbalance ratio
+BASE_HALF_SPREAD = 1      # minimum half-spread for making quotes
+SPREAD_INV_COEFF = 0.03   # widen half-spread by this much per unit of abs(position)
 
 
 class Trader:
 
     def midwall(self, order_depth: OrderDepth, top_n: int = MIDWALL_TOP_N) -> Optional[float]:
-        """
-        Estimate fair value from the deepest (highest-volume) quotes on each side.
-        """
         def wall_price(levels: dict) -> Optional[float]:
             if not levels:
                 return None
-            # Sort by absolute volume descending, take the heaviest top_n levels
-            top = sorted(levels.items(), key=lambda x: abs(
-                x[1]), reverse=True)[:top_n]
+            top = sorted(levels.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
             total_vol = sum(abs(v) for _, v in top)
             if total_vol == 0:
                 return None
@@ -37,147 +39,158 @@ class Trader:
             return ask_wall
         if ask_wall is None:
             return bid_wall
-
         return (bid_wall + ask_wall) / 2
 
-    def get_fair_value(self, product: str, order_depth: OrderDepth, position: int) -> Optional[float]:
+    def volume_imbalance(self, order_depth: OrderDepth) -> float:
+        """Returns (bid_vol - ask_vol) / (bid_vol + ask_vol), range [-1, 1]."""
+        bid_vol = sum(abs(v) for v in order_depth.buy_orders.values())
+        ask_vol = sum(abs(v) for v in order_depth.sell_orders.values())
+        total = bid_vol + ask_vol
+        if total == 0:
+            return 0.0
+        return (bid_vol - ask_vol) / total
+
+    def get_fair_value(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        position: int,
+        ema: Optional[float],
+        last_mid: Optional[float],
+    ) -> Optional[float]:
+
         if product == "EMERALDS":
-            fv = EMERALD_FAIR_VALUE
-        else:
-            # TOMATOES and others use Midwall
-            fv = self.midwall(order_depth)
+            fv = float(EMERALD_FAIR_VALUE)
 
-        if fv is None:
-            return None
-
-        # ── Inventory Skew Optimization ───────────────────────────────────────
-        # Adjust fair value based on current position to mean-revert.
-
-        # With larger position limits (80), we can absorb more inventory.
-        # But we still want to clear inventory when skewed heavily.
-        skew_factor = 0.0
-
-        if product == "EMERALDS":
-            # Stable product.
+            # Tiered inventory skew
             if abs(position) < 40:
-                skew_factor = 0.0   # Pure Market Making
+                skew_factor = 0.0
             elif abs(position) < 60:
-                skew_factor = 0.05  # Moderate Inventory Management
+                skew_factor = 0.05
             else:
-                skew_factor = 0.2   # Aggressive Dumping/Covering
-        elif product == "TOMATOES":
-            # Volatile. 0.1 * 80 -> 8 ticks.
-            skew_factor = 0.1
+                skew_factor = 0.2
 
-        fv_adj = fv - (skew_factor * position)
-        return fv_adj
+            return fv - skew_factor * position
+
+        else:
+            # ── TOMATOES (and generic products) ──────────────────────────────
+            current_mid = self.midwall(order_depth)
+            if current_mid is None:
+                return None
+
+            # 1. EMA-anchored fair value
+            if ema is None:
+                ema = current_mid
+            fv = EMA_ALPHA * current_mid + (1.0 - EMA_ALPHA) * ema
+
+            # 2. Autocorrelation reversion signal (AC1 ≈ -0.44)
+            if last_mid is not None:
+                last_return = current_mid - last_mid
+                fv -= AC1_COEFF * last_return
+
+            # 3. Volume imbalance directional nudge
+            imbalance = self.volume_imbalance(order_depth)
+            fv += IMBALANCE_COEFF * imbalance
+
+            # 4. Tiered inventory skew
+            abs_pos = abs(position)
+            if abs_pos < 30:
+                skew_factor = 0.0
+            elif abs_pos < 55:
+                skew_factor = 0.1
+            else:
+                skew_factor = 0.2
+
+            fv -= skew_factor * position
+            return fv
 
     def run(self, state: TradingState):
+        # ── Load persisted state ──────────────────────────────────────────────
+        try:
+            saved = json.loads(state.traderData) if state.traderData else {}
+        except Exception:
+            saved = {}
+
         result = {}
+        new_state = {}
 
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
             orders: List[Order] = []
 
-            # 1. Get current position and limit
             position = state.position.get(product, 0)
-            # Default to 80 if product not generic
             limit = POSITION_LIMITS.get(product, DEFAULT_LIMIT)
 
-            # 2. Calculate Fair Value
-            fv = self.get_fair_value(product, order_depth, position)
+            # Pull per-product persisted values
+            prod_state = saved.get(product, {})
+            ema = prod_state.get("ema")
+            last_mid = prod_state.get("last_mid")
+
+            # Compute fair value
+            fv = self.get_fair_value(product, order_depth, position, ema, last_mid)
             if fv is None:
                 result[product] = orders
+                new_state[product] = prod_state
                 continue
 
-            # 3. Calculate Trading Capacity
+            # Update EMA and last_mid for next tick
+            current_mid = self.midwall(order_depth)
+            if product != "EMERALDS" and current_mid is not None:
+                new_ema = EMA_ALPHA * current_mid + (1.0 - EMA_ALPHA) * (ema if ema is not None else current_mid)
+                new_state[product] = {"ema": new_ema, "last_mid": current_mid}
+            else:
+                new_state[product] = prod_state
+
             buy_capacity = limit - position
             sell_capacity = limit + position
 
             # ── Step 1: Taking (Aggressive) ───────────────────────────────────
-            # Buy any asks < FV
-            if len(order_depth.sell_orders) != 0:
-                best_asks = sorted(order_depth.sell_orders.keys())
-                for ask_price in best_asks:
-                    if ask_price > fv:
-                        break  # Asks are sorted asc, so we can stop
-
-                    if buy_capacity <= 0:
+            if order_depth.sell_orders:
+                for ask_price in sorted(order_depth.sell_orders.keys()):
+                    if ask_price > fv or buy_capacity <= 0:
                         break
+                    vol = abs(order_depth.sell_orders[ask_price])
+                    qty = min(buy_capacity, vol)
+                    if qty > 0:
+                        orders.append(Order(product, ask_price, qty))
+                        buy_capacity -= qty
 
-                    # Calculate quantity to take
-                    vol_at_price = abs(order_depth.sell_orders[ask_price])
-                    take_qty = min(buy_capacity, vol_at_price)
-
-                    if take_qty > 0:
-                        orders.append(Order(product, ask_price, take_qty))
-                        buy_capacity -= take_qty
-                        # print(f"TAKE BUY {product} {take_qty} @ {ask_price} (FV {fv:.2f})")
-
-            # Sell any bids > FV
-            if len(order_depth.buy_orders) != 0:
-                best_bids = sorted(order_depth.buy_orders.keys(), reverse=True)
-                for bid_price in best_bids:
-                    if bid_price < fv:
-                        break  # Bids are sorted desc, so we can stop
-
-                    if sell_capacity <= 0:
+            if order_depth.buy_orders:
+                for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                    if bid_price < fv or sell_capacity <= 0:
                         break
-
-                    vol_at_price = order_depth.buy_orders[bid_price]
-                    take_qty = min(sell_capacity, vol_at_price)
-
-                    if take_qty > 0:
-                        orders.append(Order(product, bid_price, -take_qty))
-                        sell_capacity -= take_qty
-                        # print(f"TAKE SELL {product} {take_qty} @ {bid_price} (FV {fv:.2f})")
+                    vol = order_depth.buy_orders[bid_price]
+                    qty = min(sell_capacity, vol)
+                    if qty > 0:
+                        orders.append(Order(product, bid_price, -qty))
+                        sell_capacity -= qty
 
             # ── Step 2: Making (Passive) ─────────────────────────────────────
-            # Place limit orders to capture spread
+            # Dynamic half-spread: widen with inventory size
+            half_spread = BASE_HALF_SPREAD + int(abs(position) * SPREAD_INV_COEFF)
 
-            # Quote Bid
-            if buy_capacity > 0:
-                best_bid = max(order_depth.buy_orders.keys()
-                               ) if order_depth.buy_orders else 0
-                best_ask = min(order_depth.sell_orders.keys()
-                               ) if order_depth.sell_orders else float('inf')
+            best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
+            best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
 
-                # Default: Improve best bid by 1
+            if buy_capacity > 0 and best_bid is not None:
                 our_bid = best_bid + 1
-
-                # Check spread constraint: If spread is 1 tick, we can't improve without crossing.
-                # If best_ask - best_bid <= 1, our_bid (best_bid+1) >= best_ask.
-                # Since we already attempted to take at best_ask in Step 1 (if it was < FV),
-                # If we are here, best_ask >= FV.
-                # So if we quote at best_ask, we are bidding >= FV, which is bad (unless skewed).
-                # But logical check: We only quote if `our_bid < fv`.
-
-                # Special handling for tight spread: Join the queue instead of doing nothing?
-                if our_bid >= best_ask:
-                    our_bid = best_bid  # Join
-
+                if best_ask is not None and our_bid >= best_ask:
+                    our_bid = best_bid  # Join rather than cross
+                # Enforce minimum distance from FV
+                our_bid = min(our_bid, int(fv) - half_spread)
                 if our_bid < fv:
                     orders.append(Order(product, our_bid, buy_capacity))
 
-            # Quote Ask
-            if sell_capacity > 0:
-                best_ask = min(order_depth.sell_orders.keys()
-                               ) if order_depth.sell_orders else float('inf')
-                best_bid = max(order_depth.buy_orders.keys()
-                               ) if order_depth.buy_orders else 0
-
-                # Default: Undercut best ask by 1
+            if sell_capacity > 0 and best_ask is not None:
                 our_ask = best_ask - 1
-
-                # Check spread constraint
-                if our_ask <= best_bid:
+                if best_bid is not None and our_ask <= best_bid:
                     our_ask = best_ask  # Join
-
+                our_ask = max(our_ask, int(fv) + half_spread)
                 if our_ask > fv:
                     orders.append(Order(product, our_ask, -sell_capacity))
 
             result[product] = orders
 
-        traderData = "OPTIMIZED_V3"
+        traderData = json.dumps(new_state)
         conversions = 0
         return result, conversions, traderData

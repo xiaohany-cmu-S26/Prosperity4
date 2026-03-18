@@ -8,7 +8,7 @@ POSITION_LIMITS = {
     "TOMATOES": 80
 }
 DEFAULT_LIMIT = 80
-MIDWALL_TOP_N = 3    # number of highest-volume levels to use per side
+MIDWALL_TOP_N = 1    # number of highest-volume levels to use per side
 
 
 class Trader:

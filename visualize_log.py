@@ -21,6 +21,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 LOG_DIR = Path("logs")
+VIZ_DIR = LOG_DIR / "visuals"
+
+BID_COLOR = "#26C281"   # green
+ASK_COLOR = "#EF5350"   # red
 
 
 def list_log_files(log_dir: Path) -> dict[str, Path]:
@@ -132,8 +136,8 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 x=df["timestamp"],
                 y=df["bid_price_1"],
                 name=f"{product} bid",
-                line=dict(color=color, width=0.8, dash="dot"),
-                opacity=0.45,
+                line=dict(color=BID_COLOR, width=0.8, dash="dot"),
+                opacity=0.6,
                 legendgroup=product,
                 showlegend=False,
             ),
@@ -146,10 +150,10 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 x=df["timestamp"],
                 y=df["ask_price_1"],
                 name=f"{product} ask",
-                line=dict(color=color, width=0.8, dash="dot"),
-                opacity=0.45,
+                line=dict(color=ASK_COLOR, width=0.8, dash="dot"),
+                opacity=0.6,
                 fill="tonexty",
-                fillcolor=to_rgba(color, 0.08),
+                fillcolor=to_rgba(BID_COLOR, 0.07),
                 legendgroup=product,
                 showlegend=False,
             ),
@@ -263,25 +267,58 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
     return fig, statesheet
 
 
+def _final_unrealized_pnl(product_trades: pd.DataFrame, final_mid: float) -> float:
+    """Unrealized PnL on the remaining open position at end of session.
+    Uses average-cost accounting; returns position * final_mid - cost_basis."""
+    position, cost_basis = 0.0, 0.0
+    for _, row in product_trades.sort_values("timestamp").iterrows():
+        if row["buyer"] == "SUBMISSION":
+            qty = float(row["quantity"])
+        elif row["seller"] == "SUBMISSION":
+            qty = -float(row["quantity"])
+        else:
+            continue
+        new_pos = position + qty
+        if position == 0:
+            cost_basis = qty * row["price"]
+        elif (position > 0) == (qty > 0):
+            cost_basis += qty * row["price"]
+        else:
+            cost_basis = cost_basis * (new_pos / position) if abs(new_pos) < abs(position) else new_pos * row["price"]
+        position = new_pos
+    return position * final_mid - cost_basis if position != 0 else 0.0
+
+
 def build_volume_summary(data: dict) -> list[dict]:
     trades = pd.DataFrame(data.get("tradeHistory", []))
     if trades.empty or not {"symbol", "quantity"}.issubset(trades.columns):
         return []
 
-    summary = (
+    all_counts = (
         trades.groupby("symbol", as_index=False)
         .agg(total_volume=("quantity", "sum"), trade_count=("quantity", "size"))
-        .sort_values("symbol")
     )
-    # Convert to native Python types for JSON serialization
+
+    has_sides = {"buyer", "seller"}.issubset(trades.columns)
+    if has_sides:
+        my_trades = trades[(trades["buyer"] == "SUBMISSION") | (trades["seller"] == "SUBMISSION")]
+        my_counts = my_trades.groupby("symbol").size().reset_index(name="my_trade_count")
+        summary = all_counts.merge(my_counts, on="symbol", how="left").fillna(0)
+        summary["my_trade_count"] = summary["my_trade_count"].astype(int)
+    else:
+        summary = all_counts
+        summary["my_trade_count"] = 0
+
+    summary = summary.sort_values("symbol")
+
     result = []
     for row in summary.to_dict(orient="records"):
         clean_row = {}
         for k, v in row.items():
             if pd.isna(v):
                 clean_row[k] = 0
-            elif isinstance(v, (int, float)):
-                clean_row[k] = int(v) if isinstance(v, (int, float)) and v == int(v) else v
+            elif isinstance(v, (int, float)) and float(v) == int(float(v)):
+                clean_row[k] = int(float(v))
             else:
                 clean_row[k] = v
         result.append(clean_row)
@@ -294,6 +331,11 @@ def build_statesheet(data: dict) -> dict:
     acts = acts.sort_values("timestamp")
     trades = pd.DataFrame(data.get("tradeHistory", []))
 
+    has_trades = (
+        not trades.empty
+        and {"symbol", "buyer", "seller", "quantity", "price"}.issubset(trades.columns)
+    )
+
     statesheet = {
         "total_pnl": 0.0,
         "positions": {},
@@ -302,28 +344,28 @@ def build_statesheet(data: dict) -> dict:
         "trades_per_asset": {},
     }
 
-    # Get final PnL for each product and total
     for product in list(acts["product"].unique()):
         df = acts[acts["product"] == product].sort_values("timestamp")
         final_pnl = float(df["profit_and_loss"].iloc[-1]) if len(df) > 0 else 0.0
         final_mid = float(df["mid_price"].iloc[-1]) if len(df) > 0 else 0.0
         statesheet["total_pnl"] += final_pnl
 
-        # Get final position for this product
         position = 0
-        if not trades.empty and {"symbol", "buyer", "seller", "quantity"}.issubset(trades.columns):
-            pt = trades[trades["symbol"] == product]
+        unrealized = 0.0
+        if has_trades:
+            pt = trades[trades["symbol"] == product].copy()
             for _, row in pt.iterrows():
                 if row["buyer"] == "SUBMISSION":
                     position += int(row["quantity"])
                 elif row["seller"] == "SUBMISSION":
                     position -= int(row["quantity"])
+            unrealized = _final_unrealized_pnl(pt, final_mid)
 
         statesheet["positions"][product] = int(position)
-        statesheet["unrealized_pnl"][product] = float(position * final_mid) if final_mid else 0.0
-        statesheet["trades_per_asset"][product] = int(len(
-            trades[trades["symbol"] == product]
-        ) if not trades.empty else 0)
+        statesheet["unrealized_pnl"][product] = unrealized
+        statesheet["trades_per_asset"][product] = int(
+            len(trades[trades["symbol"] == product]) if has_trades else 0
+        )
 
     return statesheet
 
@@ -405,7 +447,8 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
               <thead>
                   <tr>
                       <th>Product</th>
-                      <th>Count</th>
+                      <th>All</th>
+                      <th>Mine</th>
                   </tr>
               </thead>
               <tbody id="volumeTableBody"></tbody>
@@ -456,14 +499,14 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
     function renderSummary() {{
         const rows = summary || [];
         if (!rows.length) {{
-            volumeTableBody.innerHTML = '<tr><td colspan="2" style="text-align:center;">No trades</td></tr>';
+            volumeTableBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No trades</td></tr>';
             return;
         }}
-
         volumeTableBody.innerHTML = rows.map((row) => (
             `<tr>
                 <td>${{row.symbol}}</td>
                 <td style="text-align: right;">${{row.trade_count}}</td>
+                <td style="text-align: right;">${{row.my_trade_count}}</td>
             </tr>`
         )).join('');
     }}
@@ -563,7 +606,8 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
               <thead>
                   <tr>
                       <th>Product</th>
-                      <th>Count</th>
+                      <th>All</th>
+                      <th>Mine</th>
                   </tr>
               </thead>
               <tbody id="volumeTableBody"></tbody>
@@ -617,14 +661,14 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
         function renderSummary(logKey) {{
             const rows = summaries[logKey] || [];
             if (!rows.length) {{
-                volumeTableBody.innerHTML = '<tr><td colspan="2" style="text-align:center;">No trades</td></tr>';
+                volumeTableBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No trades</td></tr>';
                 return;
             }}
-
             volumeTableBody.innerHTML = rows.map((row) => (
                 `<tr>
                     <td>${{row.symbol}}</td>
                     <td style="text-align: right;">${{row.trade_count}}</td>
+                    <td style="text-align: right;">${{row.my_trade_count}}</td>
                 </tr>`
             )).join('');
         }}
@@ -675,7 +719,7 @@ def main() -> None:
         summary = build_volume_summary(data)
 
         default_name = f"{safe_file_name(args.log)}_viz.html"
-        output = Path(args.output) if args.output else LOG_DIR / default_name
+        output = Path(args.output) if args.output else VIZ_DIR / default_name
         output.parent.mkdir(parents=True, exist_ok=True)
 
         # Build custom HTML with sidebar
@@ -696,7 +740,7 @@ def main() -> None:
         summaries[log_key] = build_volume_summary(data)
         statesheets[log_key] = statesheet
 
-    output = Path(args.output) if args.output else LOG_DIR / "viz_dashboard.html"
+    output = Path(args.output) if args.output else VIZ_DIR / "viz_dashboard.html"
     build_dashboard_html(figures, summaries, statesheets, output)
     print(f"Saved dashboard: {output}")
     if not args.no_open:
