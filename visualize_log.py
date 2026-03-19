@@ -86,7 +86,7 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 inventories[product][row["timestamp"]] = inventory
 
     n = len(products)
-    specs = [[{"secondary_y": True}] for _ in range(n)] + [[{"secondary_y": False}]]
+    specs = [[{"secondary_y": True}] for _ in range(n)] + [[{"secondary_y": True}]]
     fig = make_subplots(
         rows=n + 1,
         cols=1,
@@ -120,10 +120,12 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 name=f"{product} mid",
                 line=dict(color=color, width=1.6),
                 legendgroup=product,
-                customdata=df[["inventory"]],
+                customdata=df[["timestamp", "inventory"]],
                 hovertemplate=(
                     f"<b>{product} mid price</b><br>"
-                    "t=%{x}<br>price=%{y}<br>inventory=%{customdata[0]}<extra></extra>"
+                    "<b>Tick: %{customdata[0]}</b><br>"
+                    "Price: %{y}<br>"
+                    "Inventory: %{customdata[1]}<extra></extra>"
                 ),
             ),
             row=row,
@@ -140,6 +142,12 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 opacity=0.6,
                 legendgroup=product,
                 showlegend=False,
+                customdata=df["timestamp"],
+                hovertemplate=(
+                    f"<b>{product} bid</b><br>"
+                    "<b>Tick: %{customdata}</b><br>"
+                    "Price: %{y}<extra></extra>"
+                ),
             ),
             row=row,
             col=1,
@@ -156,6 +164,12 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 fillcolor=to_rgba(BID_COLOR, 0.07),
                 legendgroup=product,
                 showlegend=False,
+                customdata=df["timestamp"],
+                hovertemplate=(
+                    f"<b>{product} ask</b><br>"
+                    "<b>Tick: %{customdata}</b><br>"
+                    "Price: %{y}<extra></extra>"
+                ),
             ),
             row=row,
             col=1,
@@ -177,9 +191,11 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                         marker_color=to_rgba(color, 0.35),
                         legendgroup=product,
                         showlegend=False,
+                        customdata=volume_per_tick["timestamp"],
                         hovertemplate=(
                             f"<b>{product} volume</b><br>"
-                            "t=%{x}<br>volume=%{y}<extra></extra>"
+                            "<b>Tick: %{customdata}</b><br>"
+                            "Volume: %{y}<extra></extra>"
                         ),
                     ),
                     row=row,
@@ -221,9 +237,10 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                                 opacity=1.0 if is_mine else 0.55,
                                 hovertemplate=(
                                     f"<b>{product} {label}</b><br>"
-                                    "t=%{x}<br>price=%{y}<br>qty=%{customdata}<extra></extra>"
+                                    "<b>Tick: %{customdata[0]}</b><br>"
+                                    "Price: %{y}<br>Qty: %{customdata[1]}<extra></extra>"
                                 ),
-                                customdata=subset["quantity"],
+                                customdata=subset[["timestamp", "quantity"]],
                             ),
                             row=row,
                             col=1,
@@ -246,13 +263,69 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
                 legendgroup=f"{product}_pnl",
                 fill="tozeroy",
                 fillcolor=to_rgba(color, 0.12),
+                customdata=df["timestamp"],
+                hovertemplate=(
+                    f"<b>{product} PnL</b><br>"
+                    "<b>Tick: %{customdata}</b><br>"
+                    "PnL: %{y}<extra></extra>"
+                ),
             ),
             row=pnl_row,
             col=1,
+            secondary_y=False,
         )
 
+        # Inventory trace on secondary y-axis
+        inv_data = inventories.get(product, {})
+        if inv_data:
+            inv_series = pd.Series(inv_data).sort_index()
+            inv_full = inv_series.reindex(df["timestamp"], method="ffill").fillna(0)
+        else:
+            inv_full = pd.Series(0, index=df["timestamp"])
+        fig.add_trace(
+            go.Scatter(
+                x=df["timestamp"],
+                y=inv_full,
+                name=f"{product} Inv",
+                line=dict(color=color, width=1.2, dash="dot"),
+                legendgroup=f"{product}_pnl",
+                showlegend=True,
+                customdata=df["timestamp"],
+                hovertemplate=(
+                    f"<b>{product} Inventory</b><br>"
+                    "<b>Tick: %{customdata}</b><br>"
+                    "Inv: %{y}<extra></extra>"
+                ),
+            ),
+            row=pnl_row,
+            col=1,
+            secondary_y=True,
+        )
+
+    # Total PnL (sum across all products)
+    total_pnl_df = acts.groupby("timestamp", as_index=False)["profit_and_loss"].sum().sort_values("timestamp")
+    fig.add_trace(
+        go.Scatter(
+            x=total_pnl_df["timestamp"],
+            y=total_pnl_df["profit_and_loss"],
+            name="Total PnL",
+            line=dict(color="white", width=2.5),
+            legendgroup="total_pnl",
+            customdata=total_pnl_df["timestamp"],
+            hovertemplate=(
+                "<b>Total PnL</b><br>"
+                "<b>Tick: %{customdata}</b><br>"
+                "PnL: %{y}<extra></extra>"
+            ),
+        ),
+        row=pnl_row,
+        col=1,
+        secondary_y=False,
+    )
+
     total_trades = len(trades) if not trades.empty else 0
-    fig.update_yaxes(title_text="PnL", row=pnl_row, col=1)
+    fig.update_yaxes(title_text="PnL", row=pnl_row, col=1, secondary_y=False)
+    fig.update_yaxes(title_text="Inventory", row=pnl_row, col=1, secondary_y=True)
     fig.update_xaxes(title_text="Timestamp", row=pnl_row, col=1)
     fig.update_layout(
         title=dict(text=f"IMC Prosperity — Log {log_label} | {total_trades} trades", font=dict(size=18)),
@@ -300,6 +373,62 @@ def build_volume_summary(data: dict) -> list[dict]:
     )
 
     has_sides = {"buyer", "seller"}.issubset(trades.columns)
+
+    # Calculate profitable vs unprofitable trades using FIFO accounting
+    profitable = {}
+    unprofitable = {}
+
+    if has_sides and "price" in trades.columns:
+        for product in trades["symbol"].unique():
+            pt = trades[trades["symbol"] == product].copy().sort_values("timestamp")
+
+            # Separate buys and sells
+            buys = pt[pt["buyer"] == "SUBMISSION"].copy()
+            sells = pt[pt["seller"] == "SUBMISSION"].copy()
+
+            if not buys.empty and not sells.empty:
+                # Track realized PnL using FIFO
+                buy_queue = list(zip(buys["price"], buys["quantity"]))
+                sell_queue = list(zip(sells["price"], sells["quantity"]))
+
+                realized_pnl = 0.0
+                sell_qty_remaining = 0
+                sell_price_current = 0.0
+
+                for sell_price, sell_qty in sell_queue:
+                    sell_qty_remaining = sell_qty
+                    sell_price_current = sell_price
+
+                    # Match with buys in order (FIFO)
+                    while sell_qty_remaining > 0 and buy_queue:
+                        buy_price, buy_qty = buy_queue.pop(0)
+                        matched_qty = min(sell_qty_remaining, buy_qty)
+                        realized_pnl += matched_qty * (sell_price - buy_price)
+                        sell_qty_remaining -= matched_qty
+
+                        if buy_qty > matched_qty:
+                            buy_queue.insert(0, (buy_price, buy_qty - matched_qty))
+
+                # Count profitable trades (those with positive contribution to PnL)
+                # A trade is profitable if it improved our position
+                buy_proceeds = buys["quantity"].sum() * buys["price"].mean() if not buys.empty else 0
+                sell_proceeds = sells["quantity"].sum() * sells["price"].mean() if not sells.empty else 0
+
+                if realized_pnl > 0:
+                    profitable[product] = len(sells)
+                    unprofitable[product] = 0
+                else:
+                    profitable[product] = 0
+                    unprofitable[product] = len(sells)
+            elif not buys.empty or not sells.empty:
+                # Only one side, count as unprofitable (unrealized)
+                product_trades = len(buys) if not buys.empty else len(sells)
+                profitable[product] = 0
+                unprofitable[product] = product_trades
+            else:
+                profitable[product] = 0
+                unprofitable[product] = 0
+
     if has_sides:
         my_trades = trades[(trades["buyer"] == "SUBMISSION") | (trades["seller"] == "SUBMISSION")]
         my_counts = my_trades.groupby("symbol").size().reset_index(name="my_trade_count")
@@ -308,6 +437,10 @@ def build_volume_summary(data: dict) -> list[dict]:
     else:
         summary = all_counts
         summary["my_trade_count"] = 0
+
+    # Add profitability columns
+    summary["profitable"] = summary["symbol"].map(lambda x: profitable.get(x, 0))
+    summary["unprofitable"] = summary["symbol"].map(lambda x: unprofitable.get(x, 0))
 
     summary = summary.sort_values("symbol")
 
@@ -370,7 +503,70 @@ def build_statesheet(data: dict) -> dict:
     return statesheet
 
 
-def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict], log_label: str, output_path: Path) -> None:
+def build_raw_timeseries(data: dict) -> dict:
+    """Build per-product timeseries data for JS dynamic sidebar computation."""
+    acts = pd.read_csv(StringIO(data["activitiesLog"]), sep=";").sort_values("timestamp")
+    trades = pd.DataFrame(data.get("tradeHistory", []))
+    products = sorted(acts["product"].unique())
+
+    has_trades = (
+        not trades.empty
+        and {"symbol", "buyer", "seller", "quantity", "price", "timestamp"}.issubset(trades.columns)
+    )
+
+    timeseries = {}
+    for product in products:
+        df = acts[acts["product"] == product].sort_values("timestamp")
+        timestamps = df["timestamp"].tolist()
+        pnl = df["profit_and_loss"].tolist()
+
+        # Build inventory series
+        inv = [0] * len(timestamps)
+        if has_trades:
+            pt = trades[trades["symbol"] == product].sort_values("timestamp")
+            inventory = 0
+            inv_dict = {}
+            for _, row in pt.iterrows():
+                if row["buyer"] == "SUBMISSION":
+                    inventory += int(row["quantity"])
+                elif row["seller"] == "SUBMISSION":
+                    inventory -= int(row["quantity"])
+                inv_dict[row["timestamp"]] = inventory
+            if inv_dict:
+                inv_series = pd.Series(inv_dict).sort_index()
+                inv_full = inv_series.reindex(timestamps, method="ffill").fillna(0)
+                inv = inv_full.astype(int).tolist()
+
+        timeseries[product] = {
+            "timestamps": timestamps,
+            "pnl": pnl,
+            "inventory": inv,
+        }
+
+    # Build trade list for filtering by range
+    trade_list = {}
+    if has_trades:
+        for product in products:
+            pt = trades[trades["symbol"] == product].sort_values("timestamp")
+            entries = []
+            for _, row in pt.iterrows():
+                side = "bot"
+                if row["buyer"] == "SUBMISSION":
+                    side = "buy"
+                elif row["seller"] == "SUBMISSION":
+                    side = "sell"
+                entries.append({
+                    "t": int(row["timestamp"]),
+                    "side": side,
+                    "price": float(row["price"]),
+                    "qty": int(row["quantity"]),
+                })
+            trade_list[product] = entries
+
+    return {"timeseries": timeseries, "trades": trade_list}
+
+
+def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict], raw_ts: dict, log_label: str, output_path: Path) -> None:
     """Build HTML for a single log with sidebar stats."""
     import numpy as np
 
@@ -384,6 +580,7 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
     fig_json = json.dumps(fig.to_plotly_json(), default=json_serializer)
     statesheet_json = json.dumps(statesheet)
     summary_json = json.dumps(summary)
+    raw_ts_json = json.dumps(raw_ts, default=json_serializer)
 
     html = f"""<!doctype html>
 <html lang=\"en\">
@@ -401,6 +598,7 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
     .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; }}
     .summary {{ margin-bottom: 24px; }}
     .summary h3 {{ margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color:#aaa; font-weight: 600; }}
+    .range-label {{ font-size: 10px; color: #666; margin-bottom: 8px; }}
     table {{ border-collapse: collapse; width: 100%; background:#171717; font-size: 11px; }}
     th, td {{ border: 1px solid #333; padding: 5px 6px; text-align: right; }}
     th:first-child, td:first-child {{ text-align: left; }}
@@ -414,15 +612,12 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
   <div class=\"container\">
     <div id=\"chart\"></div>
     <div class=\"sidebar\">
+      <div id="rangeLabel" class="range-label">Showing: full range</div>
+
       <div class="summary">
-          <h3>Final State</h3>
+          <h3>State</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Metric</th>
-                      <th>Value</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Metric</th><th>Value</th></tr></thead>
               <tbody id="statesheetBody"></tbody>
           </table>
       </div>
@@ -430,13 +625,7 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
       <div class="summary">
           <h3>Positions</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Product</th>
-                      <th>Inv</th>
-                      <th>Unrealized</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Product</th><th>Inv</th><th>PnL</th></tr></thead>
               <tbody id="positionsTableBody"></tbody>
           </table>
       </div>
@@ -444,13 +633,7 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
       <div class="summary">
           <h3>Trades</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Product</th>
-                      <th>All</th>
-                      <th>Mine</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Product</th><th>Total</th><th>My</th><th>Buy</th><th>Sell</th></tr></thead>
               <tbody id="volumeTableBody"></tbody>
           </table>
       </div>
@@ -459,62 +642,135 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
 
   <script>
     const figure = {fig_json};
-    const statesheet = {statesheet_json};
-    const summary = {summary_json};
+    const rawTs = {raw_ts_json};
     const chart = document.getElementById('chart');
-    const statesheetBody = document.getElementById('statesheetBody');
-    const positionsTableBody = document.getElementById('positionsTableBody');
-    const volumeTableBody = document.getElementById('volumeTableBody');
 
-    function renderStatesheet() {{
-        const rows = [
-            ['Total PnL', (statesheet.total_pnl || 0).toFixed(0)],
-            ['Total Trades', statesheet.total_trades || 0]
-        ];
-        statesheetBody.innerHTML = rows.map((row) => (
-            `<tr>
-                <td>${{row[0]}}</td>
-                <td style="text-align: right;">${{row[1]}}</td>
-            </tr>`
-        )).join('');
-    }}
+    // Compute stats for a given timestamp range [tMin, tMax]
+    function computeStats(tMin, tMax) {{
+        const ts = rawTs.timeseries || {{}};
+        const trades = rawTs.trades || {{}};
+        const products = Object.keys(ts).sort();
 
-    function renderPositions() {{
-        const positions = statesheet.positions || {{}};
-        const unrealized = statesheet.unrealized_pnl || {{}};
-        const rows = Object.entries(positions).map(([product, inventory]) => [
-            product,
-            inventory,
-            (unrealized[product] || 0).toFixed(0)
-        ]);
-        positionsTableBody.innerHTML = rows.map((row) => (
-            `<tr>
-                <td>${{row[0]}}</td>
-                <td style="text-align: right;">${{row[1]}}</td>
-                <td style="text-align: right;">${{row[2]}}</td>
-            </tr>`
-        )).join('');
-    }}
+        let totalPnl = 0;
+        let totalTrades = 0;
+        let totalMyTrades = 0;
+        const productStats = [];
 
-    function renderSummary() {{
-        const rows = summary || [];
-        if (!rows.length) {{
-            volumeTableBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No trades</td></tr>';
-            return;
+        for (const product of products) {{
+            const d = ts[product];
+            const timestamps = d.timestamps;
+            const pnl = d.pnl;
+            const inv = d.inventory;
+
+            // Find indices within range
+            let iStart = -1, iEnd = -1;
+            for (let i = 0; i < timestamps.length; i++) {{
+                if (timestamps[i] >= tMin && iStart === -1) iStart = i;
+                if (timestamps[i] <= tMax) iEnd = i;
+            }}
+
+            let pnlInRange = 0;
+            let invAtEnd = 0;
+            if (iStart >= 0 && iEnd >= 0) {{
+                const startPnl = iStart > 0 ? pnl[iStart - 1] : 0;
+                pnlInRange = pnl[iEnd] - startPnl;
+                invAtEnd = inv[iEnd];
+            }}
+
+            // Count trades in range
+            const productTrades = trades[product] || [];
+            let tradeCount = 0, myCount = 0, buyCount = 0, sellCount = 0;
+            for (const t of productTrades) {{
+                if (t.t >= tMin && t.t <= tMax) {{
+                    tradeCount++;
+                    if (t.side === 'buy') {{ myCount++; buyCount++; }}
+                    else if (t.side === 'sell') {{ myCount++; sellCount++; }}
+                }}
+            }}
+
+            totalPnl += pnlInRange;
+            totalTrades += tradeCount;
+            totalMyTrades += myCount;
+
+            productStats.push({{
+                product, pnlInRange, invAtEnd,
+                tradeCount, myCount, buyCount, sellCount
+            }});
         }}
-        volumeTableBody.innerHTML = rows.map((row) => (
-            `<tr>
-                <td>${{row.symbol}}</td>
-                <td style="text-align: right;">${{row.trade_count}}</td>
-                <td style="text-align: right;">${{row.my_trade_count}}</td>
-            </tr>`
-        )).join('');
+
+        return {{ totalPnl, totalTrades, totalMyTrades, productStats }};
+    }}
+
+    function renderSidebar(tMin, tMax, isFullRange) {{
+        const stats = computeStats(tMin, tMax);
+
+        // Range label
+        const rangeLabel = document.getElementById('rangeLabel');
+        if (isFullRange) {{
+            rangeLabel.textContent = 'Showing: full range';
+        }} else {{
+            rangeLabel.textContent = `Showing: ${{Math.round(tMin)}} — ${{Math.round(tMax)}}`;
+        }}
+
+        // State table
+        document.getElementById('statesheetBody').innerHTML = [
+            ['Total PnL', stats.totalPnl.toFixed(0)],
+            ['Total Trades', stats.totalTrades],
+            ['My Trades', stats.totalMyTrades],
+        ].map(r => `<tr><td>${{r[0]}}</td><td>${{r[1]}}</td></tr>`).join('');
+
+        // Positions table
+        document.getElementById('positionsTableBody').innerHTML = stats.productStats.map(s =>
+            `<tr><td>${{s.product}}</td><td>${{s.invAtEnd}}</td><td>${{s.pnlInRange.toFixed(0)}}</td></tr>`
+        ).join('');
+
+        // Trades table
+        document.getElementById('volumeTableBody').innerHTML = stats.productStats.map(s =>
+            `<tr><td>${{s.product}}</td><td>${{s.tradeCount}}</td><td>${{s.myCount}}</td><td style="color:#4CAF50">${{s.buyCount}}</td><td style="color:#FF6B6B">${{s.sellCount}}</td></tr>`
+        ).join('');
+    }}
+
+    // Get full timestamp range
+    function getFullRange() {{
+        let tMin = Infinity, tMax = -Infinity;
+        for (const d of Object.values(rawTs.timeseries || {{}})) {{
+            if (d.timestamps.length) {{
+                tMin = Math.min(tMin, d.timestamps[0]);
+                tMax = Math.max(tMax, d.timestamps[d.timestamps.length - 1]);
+            }}
+        }}
+        return [tMin, tMax];
     }}
 
     Plotly.newPlot(chart, figure.data, figure.layout, {{responsive: true}});
-    renderStatesheet();
-    renderPositions();
-    renderSummary();
+
+    // Initial render with full range
+    const [fullMin, fullMax] = getFullRange();
+    renderSidebar(fullMin, fullMax, true);
+
+    // Update sidebar on zoom/pan
+    chart.on('plotly_relayout', function(eventData) {{
+        // Find the x-axis range — shared x-axes mean any xaxis range works
+        let tMin = null, tMax = null;
+        for (const key of Object.keys(eventData)) {{
+            if (key.match(/^xaxis\\d*\\.range\\[0\\]$/)) {{
+                tMin = parseFloat(eventData[key]);
+            }}
+            if (key.match(/^xaxis\\d*\\.range\\[1\\]$/)) {{
+                tMax = parseFloat(eventData[key]);
+            }}
+        }}
+
+        // Check for autorange (double-click reset)
+        const hasAutorange = Object.keys(eventData).some(k => k.match(/^xaxis\\d*\\.autorange$/));
+
+        if (hasAutorange || (tMin === null && tMax === null)) {{
+            const [fMin, fMax] = getFullRange();
+            renderSidebar(fMin, fMax, true);
+        }} else if (tMin !== null && tMax !== null) {{
+            renderSidebar(tMin, tMax, false);
+        }}
+    }});
   </script>
 </body>
 </html>
@@ -523,7 +779,7 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
     output_path.write_text(html)
 
 
-def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dict]], statesheets: dict[str, dict], output_path: Path) -> None:
+def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dict]], statesheets: dict[str, dict], all_raw_ts: dict[str, dict], output_path: Path) -> None:
     keys = sorted(figures.keys())
     if not keys:
         raise ValueError("No logs available to visualize.")
@@ -538,8 +794,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
         raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
     fig_json = json.dumps(figures, default=json_serializer)
-    summaries_json = json.dumps(summaries, default=json_serializer)
-    statesheets_json = json.dumps(statesheets, default=json_serializer)
+    all_raw_ts_json = json.dumps(all_raw_ts, default=json_serializer)
     option_html = "\n".join([f'<option value="{k}">{k}</option>' for k in keys])
 
     html = f"""<!doctype html>
@@ -559,6 +814,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
     .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; }}
     .summary {{ margin-bottom: 24px; }}
     .summary h3 {{ margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color:#aaa; font-weight: 600; }}
+    .range-label {{ font-size: 10px; color: #666; margin-bottom: 8px; }}
     table {{ border-collapse: collapse; width: 100%; background:#171717; font-size: 11px; }}
     th, td {{ border: 1px solid #333; padding: 5px 6px; text-align: right; }}
     th:first-child, td:first-child {{ text-align: left; }}
@@ -573,15 +829,12 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
   <div class=\"container\">
     <div id=\"chart\"></div>
     <div class=\"sidebar\">
+      <div id="rangeLabel" class="range-label">Showing: full range</div>
+
       <div class="summary">
-          <h3>Final State</h3>
+          <h3>State</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Metric</th>
-                      <th>Value</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Metric</th><th>Value</th></tr></thead>
               <tbody id="statesheetBody"></tbody>
           </table>
       </div>
@@ -589,13 +842,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
       <div class="summary">
           <h3>Positions</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Product</th>
-                      <th>Inv</th>
-                      <th>Unrealized</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Product</th><th>Inv</th><th>PnL</th></tr></thead>
               <tbody id="positionsTableBody"></tbody>
           </table>
       </div>
@@ -603,13 +850,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
       <div class="summary">
           <h3>Trades</h3>
           <table>
-              <thead>
-                  <tr>
-                      <th>Product</th>
-                      <th>All</th>
-                      <th>Mine</th>
-                  </tr>
-              </thead>
+              <thead><tr><th>Product</th><th>Total</th><th>My</th><th>Buy</th><th>Sell</th></tr></thead>
               <tbody id="volumeTableBody"></tbody>
           </table>
       </div>
@@ -618,68 +859,118 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
 
   <script>
     const figures = {fig_json};
-        const summaries = {summaries_json};
-        const statesheets = {statesheets_json};
+    const allRawTs = {all_raw_ts_json};
     const select = document.getElementById('logSelect');
     const chart = document.getElementById('chart');
-        const statesheetBody = document.getElementById('statesheetBody');
-        const positionsTableBody = document.getElementById('positionsTableBody');
-        const volumeTableBody = document.getElementById('volumeTableBody');
+    let currentLogKey = null;
 
-        function renderStatesheet(logKey) {{
-            const state = statesheets[logKey] || {{}};
-            const rows = [
-                ['Total PnL', (state.total_pnl || 0).toFixed(0)],
-                ['Total Trades', state.total_trades || 0]
-            ];
-            statesheetBody.innerHTML = rows.map((row) => (
-                `<tr>
-                    <td>${{row[0]}}</td>
-                    <td style="text-align: right;">${{row[1]}}</td>
-                </tr>`
-            )).join('');
-        }}
+    function computeStats(rawTs, tMin, tMax) {{
+        const ts = rawTs.timeseries || {{}};
+        const trades = rawTs.trades || {{}};
+        const products = Object.keys(ts).sort();
 
-        function renderPositions(logKey) {{
-            const state = statesheets[logKey] || {{}};
-            const positions = state.positions || {{}};
-            const unrealized = state.unrealized_pnl || {{}};
-            const rows = Object.entries(positions).map(([product, inventory]) => [
-                product,
-                inventory,
-                (unrealized[product] || 0).toFixed(0)
-            ]);
-            positionsTableBody.innerHTML = rows.map((row) => (
-                `<tr>
-                    <td>${{row[0]}}</td>
-                    <td style="text-align: right;">${{row[1]}}</td>
-                    <td style="text-align: right;">${{row[2]}}</td>
-                </tr>`
-            )).join('');
-        }}
+        let totalPnl = 0, totalTrades = 0, totalMyTrades = 0;
+        const productStats = [];
 
-        function renderSummary(logKey) {{
-            const rows = summaries[logKey] || [];
-            if (!rows.length) {{
-                volumeTableBody.innerHTML = '<tr><td colspan="3" style="text-align:center;">No trades</td></tr>';
-                return;
+        for (const product of products) {{
+            const d = ts[product];
+            const timestamps = d.timestamps;
+            const pnl = d.pnl;
+            const inv = d.inventory;
+
+            let iStart = -1, iEnd = -1;
+            for (let i = 0; i < timestamps.length; i++) {{
+                if (timestamps[i] >= tMin && iStart === -1) iStart = i;
+                if (timestamps[i] <= tMax) iEnd = i;
             }}
-            volumeTableBody.innerHTML = rows.map((row) => (
-                `<tr>
-                    <td>${{row.symbol}}</td>
-                    <td style="text-align: right;">${{row.trade_count}}</td>
-                    <td style="text-align: right;">${{row.my_trade_count}}</td>
-                </tr>`
-            )).join('');
+
+            let pnlInRange = 0, invAtEnd = 0;
+            if (iStart >= 0 && iEnd >= 0) {{
+                const startPnl = iStart > 0 ? pnl[iStart - 1] : 0;
+                pnlInRange = pnl[iEnd] - startPnl;
+                invAtEnd = inv[iEnd];
+            }}
+
+            const productTrades = trades[product] || [];
+            let tradeCount = 0, myCount = 0, buyCount = 0, sellCount = 0;
+            for (const t of productTrades) {{
+                if (t.t >= tMin && t.t <= tMax) {{
+                    tradeCount++;
+                    if (t.side === 'buy') {{ myCount++; buyCount++; }}
+                    else if (t.side === 'sell') {{ myCount++; sellCount++; }}
+                }}
+            }}
+
+            totalPnl += pnlInRange;
+            totalTrades += tradeCount;
+            totalMyTrades += myCount;
+            productStats.push({{ product, pnlInRange, invAtEnd, tradeCount, myCount, buyCount, sellCount }});
         }}
+
+        return {{ totalPnl, totalTrades, totalMyTrades, productStats }};
+    }}
+
+    function getFullRange(rawTs) {{
+        let tMin = Infinity, tMax = -Infinity;
+        for (const d of Object.values(rawTs.timeseries || {{}})) {{
+            if (d.timestamps.length) {{
+                tMin = Math.min(tMin, d.timestamps[0]);
+                tMax = Math.max(tMax, d.timestamps[d.timestamps.length - 1]);
+            }}
+        }}
+        return [tMin, tMax];
+    }}
+
+    function renderSidebar(rawTs, tMin, tMax, isFullRange) {{
+        const stats = computeStats(rawTs, tMin, tMax);
+
+        document.getElementById('rangeLabel').textContent = isFullRange
+            ? 'Showing: full range'
+            : `Showing: ${{Math.round(tMin)}} — ${{Math.round(tMax)}}`;
+
+        document.getElementById('statesheetBody').innerHTML = [
+            ['Total PnL', stats.totalPnl.toFixed(0)],
+            ['Total Trades', stats.totalTrades],
+            ['My Trades', stats.totalMyTrades],
+        ].map(r => `<tr><td>${{r[0]}}</td><td>${{r[1]}}</td></tr>`).join('');
+
+        document.getElementById('positionsTableBody').innerHTML = stats.productStats.map(s =>
+            `<tr><td>${{s.product}}</td><td>${{s.invAtEnd}}</td><td>${{s.pnlInRange.toFixed(0)}}</td></tr>`
+        ).join('');
+
+        document.getElementById('volumeTableBody').innerHTML = stats.productStats.map(s =>
+            `<tr><td>${{s.product}}</td><td>${{s.tradeCount}}</td><td>${{s.myCount}}</td><td style="color:#4CAF50">${{s.buyCount}}</td><td style="color:#FF6B6B">${{s.sellCount}}</td></tr>`
+        ).join('');
+    }}
 
     function draw(logKey) {{
-      const fig = figures[logKey];
-      Plotly.react(chart, fig.data, fig.layout, {{responsive: true}});
-            renderStatesheet(logKey);
-            renderPositions(logKey);
-            renderSummary(logKey);
+        currentLogKey = logKey;
+        const fig = figures[logKey];
+        Plotly.react(chart, fig.data, fig.layout, {{responsive: true}});
+        const rawTs = allRawTs[logKey] || {{ timeseries: {{}}, trades: {{}} }};
+        const [fMin, fMax] = getFullRange(rawTs);
+        renderSidebar(rawTs, fMin, fMax, true);
     }}
+
+    chart.on('plotly_relayout', function(eventData) {{
+        if (!currentLogKey) return;
+        const rawTs = allRawTs[currentLogKey] || {{ timeseries: {{}}, trades: {{}} }};
+
+        let tMin = null, tMax = null;
+        for (const key of Object.keys(eventData)) {{
+            if (key.match(/^xaxis\\d*\\.range\\[0\\]$/)) tMin = parseFloat(eventData[key]);
+            if (key.match(/^xaxis\\d*\\.range\\[1\\]$/)) tMax = parseFloat(eventData[key]);
+        }}
+
+        const hasAutorange = Object.keys(eventData).some(k => k.match(/^xaxis\\d*\\.autorange$/));
+
+        if (hasAutorange || (tMin === null && tMax === null)) {{
+            const [fMin, fMax] = getFullRange(rawTs);
+            renderSidebar(rawTs, fMin, fMax, true);
+        }} else if (tMin !== null && tMax !== null) {{
+            renderSidebar(rawTs, tMin, tMax, false);
+        }}
+    }});
 
     select.addEventListener('change', (e) => draw(e.target.value));
     draw(select.value || Object.keys(figures)[0]);
@@ -717,13 +1008,14 @@ def main() -> None:
         data = load_log(logs[args.log])
         fig, statesheet = build_chart(data, args.log)
         summary = build_volume_summary(data)
+        raw_ts = build_raw_timeseries(data)
 
         default_name = f"{safe_file_name(args.log)}_viz.html"
         output = Path(args.output) if args.output else VIZ_DIR / default_name
         output.parent.mkdir(parents=True, exist_ok=True)
 
         # Build custom HTML with sidebar
-        build_single_log_html(fig, statesheet, summary, args.log, output)
+        build_single_log_html(fig, statesheet, summary, raw_ts, args.log, output)
         print(f"Saved single-log visualization: {output}")
 
         if not args.no_open:
@@ -733,15 +1025,17 @@ def main() -> None:
     figures: dict[str, dict] = {}
     summaries: dict[str, list[dict]] = {}
     statesheets: dict[str, dict] = {}
+    all_raw_ts: dict[str, dict] = {}
     for log_key, path in logs.items():
         data = load_log(path)
         fig, statesheet = build_chart(data, log_key)
         figures[log_key] = fig.to_plotly_json()
         summaries[log_key] = build_volume_summary(data)
         statesheets[log_key] = statesheet
+        all_raw_ts[log_key] = build_raw_timeseries(data)
 
     output = Path(args.output) if args.output else VIZ_DIR / "viz_dashboard.html"
-    build_dashboard_html(figures, summaries, statesheets, output)
+    build_dashboard_html(figures, summaries, statesheets, all_raw_ts, output)
     print(f"Saved dashboard: {output}")
     if not args.no_open:
         webbrowser.open(output.resolve().as_uri())
