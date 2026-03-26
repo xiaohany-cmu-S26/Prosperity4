@@ -56,47 +56,51 @@ The algorithm behaves differently based on spread width:
 
 ## Backtester
 
-Replays tutorial round CSV data through any algo's `Trader.run()` with a two-phase matching engine:
+Adapted from [jmerle/imc-prosperity-3-backtester](https://github.com/jmerle/imc-prosperity-3-backtester) for Prosperity 4. Replays tutorial round CSV data through any algo's `Trader.run()` with a two-phase matching engine:
 
-1. **Passive fills**: resting orders from the previous tick get filled when market trades occur at prices that would cross our quotes
-2. **Aggressive fills**: orders that cross the current book fill immediately
+1. **Order depth matching**: orders that cross the current book fill immediately at the book price
+2. **Market trade matching**: remaining unfilled volume is matched against historical market trades at favorable prices
+
+Trade matching mode controls phase 2: `all` (default) matches trades at prices equal to or better than your quote, `worse` only matches strictly better prices, `none` skips market trade matching entirely.
 
 ### Usage
 
 ```bash
-# Run default algo (trading.py) on both days
+# Run default algo (trading.py) on all available days
 python3 backtest.py
 
 # Run a specific algo file
 python3 backtest.py --algo my_strat.py
 
-# Single day, verbose fill logging
-python3 backtest.py --day -1 --verbose
+# Single day
+python3 backtest.py --day -1
 
-# Disable CSV log output
-python3 backtest.py --no-log
+# Stricter matching (only match market trades at worse prices)
+python3 backtest.py --match-trades worse
 
-# Custom log directory
-python3 backtest.py --log-dir results/
+# Print trader stdout while running
+python3 backtest.py --print
+
+# Custom data directory and round
+python3 backtest.py --data ROUND_1 --round 1
+
+# Skip saving output
+python3 backtest.py --no-out
+
+# Merge PnL across days
+python3 backtest.py --merge-pnl
 ```
 
-### CSV Log Output
+### Output
 
-The backtester writes per-tick CSV logs to `logs/backtest_{algo}_day_{day}.csv` with columns:
-
-| Column | Description |
-|--------|-------------|
-| `day`, `timestamp`, `product` | Tick identifier |
-| `bid/ask_price/volume_1-3` | Order book snapshot |
-| `mid_price`, `profit_and_loss` | Market state |
-| `position` | Current position after fills |
-| `our_bid/ask`, `our_bid/ask_vol` | Quotes placed this tick |
-| `fill_side`, `fill_price`, `fill_qty`, `fill_type` | Fill details (aggressive/passive) |
+The backtester writes two files to `logs/`:
+- `backtest_{algo}.json` — JSON format compatible with `visualize_log.py`
+- `backtest_{algo}.log` — P3-style log format (Sandbox logs / Activities log / Trade History)
 
 ### Algo File Requirements
 
 Any `.py` file with:
-- A `Trader` class with a `run(state: TradingState)` method returning `(result, conversions, traderData)`
+- A `Trader` class with a `run(state: TradingState)` method returning `(orders, conversions, traderData)`
 - Optional `POSITION_LIMITS` dict and `DEFAULT_LIMIT` int (defaults to 80)
 
 ## Visualizer
