@@ -951,6 +951,14 @@ def main():
     args = parser.parse_args()
 
     algo_path = Path(args.algo)
+    # Auto-add .py extension if missing
+    if not algo_path.suffix:
+        algo_path = algo_path.with_suffix(".py")
+    # Try logs/ prefix if not found
+    if not algo_path.exists():
+        candidate = Path("logs") / algo_path
+        if candidate.exists():
+            algo_path = candidate
     if not algo_path.exists():
         print(f"Error: algo file not found: {algo_path}")
         sys.exit(1)
