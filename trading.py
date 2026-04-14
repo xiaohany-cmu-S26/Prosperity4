@@ -1,235 +1,231 @@
+import json
 from datamodel import OrderDepth, UserId, TradingState, Order
-from typing import List, Optional
-import math
+from typing import Dict, List, Optional, Tuple
 
-EMERALD_FAIR_VALUE = 10000
-POSITION_LIMITS = {
-    "EMERALDS": 80,
-    "TOMATOES": 80
+# ── Per-product configuration ─────────────────────────────────────────────────
+# fair_value:    "midwall" (EMA of best-bid/ask mid) or a float (hardcoded)
+# ema_alpha:     EMA smoothing factor (only used when fair_value="midwall")
+# skew_tiers:    list of (position_threshold, skew_factor)
+#                Skew adjusts FV away from current position to manage inventory.
+# quote_offset:  ticks outside best bid/ask for passive quotes (book-relative)
+# fv_spread:     if set, post passive quotes at base_fv ± fv_spread (FV-relative)
+#                overrides quote_offset for passive making
+# max_passive_qty: max units per passive order
+PRODUCT_CONFIG = {
+    "INTARIAN_PEPPER_ROOT": {
+        "limit": 80,
+        # FV rises at exactly 0.001/timestamp-unit (= 0.1/tick = 1000/day).
+        # Anchor to the first observed mid each day and extrapolate linearly.
+        "fair_value": "linear_trend",
+        "trend_slope": 0.001,
+        "skew_tiers": [
+            (40, 0.0),   # |pos| <  40  -> pure market-making
+            (60, 0.05),  # |pos| <  60  -> light inventory skew
+            (80, 0.2),   # |pos| >= 60  -> aggressive inventory clear
+        ],
+        # Join the best bid/ask (quote_offset=0) — structural MMs sit at
+        # FV ± 6.5–7.5; joining their queue earns ~13 ticks/round-trip and
+        # keeps fills symmetric in the trending market.
+        "quote_offset": 0,
+        "max_passive_qty": 10,
+    },
+    "ASH_COATED_OSMIUM": {
+        "limit": 80,
+        # True fair value is anchored at 10000 — strong mean reversion confirmed
+        # empirically (lag-1 autocorr = -0.49, E[return | far from 10k] is large).
+        "fair_value": 10000,
+        "skew_tiers": [
+            (80, 0.1),   # flat skew across all positions
+        ],
+        # Post passive quotes at fixed levels 7 ticks from FV (just inside the
+        # structural market makers who post at ±8). This earns 14 ticks/round-trip
+        # and gets priority over the bots anchored at ±8.
+        "fv_spread": 7,
+        "max_passive_qty": 12,
+    },
 }
+
 DEFAULT_LIMIT = 80
 
 
 class Trader:
 
-    def micro_dev_l2(self, order_depth: OrderDepth) -> Optional[float]:
-        bids = sorted(order_depth.buy_orders.keys(), reverse=True)
-        asks = sorted(order_depth.sell_orders.keys())
-        if len(bids) < 2 or len(asks) < 2:
-            return None
-        bid_price_2 = bids[1]
-        ask_price_2 = asks[1]
-        bid_volume_2 = abs(order_depth.buy_orders[bid_price_2])
-        ask_volume_2 = abs(order_depth.sell_orders[ask_price_2])
-        total_vol = bid_volume_2 + ask_volume_2
-        if total_vol == 0:
-            return None
-        return (bid_price_2 * ask_volume_2 + ask_price_2 * bid_volume_2) / total_vol
+    # ── Fair-value helpers ────────────────────────────────────────────────────
 
-    def get_spread(self, order_depth: OrderDepth) -> Optional[int]:
-        if not order_depth.buy_orders or not order_depth.sell_orders:
+    def raw_mid(self, order_depth: OrderDepth) -> Optional[float]:
+        """Best-bid / best-ask mid (top of book)."""
+        if not order_depth.buy_orders and not order_depth.sell_orders:
             return None
-        return min(order_depth.sell_orders.keys()) - max(order_depth.buy_orders.keys())
-
-    def get_mid(self, order_depth: OrderDepth) -> Optional[float]:
-        if not order_depth.buy_orders or not order_depth.sell_orders:
-            return None
+        if not order_depth.buy_orders:
+            return float(min(order_depth.sell_orders.keys()))
+        if not order_depth.sell_orders:
+            return float(max(order_depth.buy_orders.keys()))
         return (max(order_depth.buy_orders.keys()) + min(order_depth.sell_orders.keys())) / 2
 
-    def get_fair_value(self, product: str, order_depth: OrderDepth, position: int) -> Optional[float]:
-        if product == "EMERALDS":
-            fv = EMERALD_FAIR_VALUE
-        else:
-            mid = self.get_mid(order_depth)
+    def skew_factor(self, position: int, tiers: list) -> float:
+        for threshold, factor in tiers:
+            if abs(position) < threshold:
+                return factor
+        return tiers[-1][1]
+
+    def get_base_fv(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        ema_state: Dict[str, float],
+        timestamp: int,
+    ) -> Optional[float]:
+        """
+        Returns the base (pre-skew) fair value.
+        Fixed float         -> use directly.
+        'linear_trend'      -> init_fv + slope * (ts - init_ts), anchored at
+                               the first observed mid each day.
+        'midwall' (default) -> EMA of top-of-book mid.
+        """
+        cfg    = PRODUCT_CONFIG.get(product, {})
+        fv_cfg = cfg.get("fair_value", "midwall")
+
+        if isinstance(fv_cfg, (int, float)):
+            return float(fv_cfg)
+
+        if fv_cfg == "linear_trend":
+            slope       = cfg.get("trend_slope", 0.0)
+            init_fv_key = product + "_init_fv"
+            init_ts_key = product + "_init_ts"
+            mid = self.raw_mid(order_depth)
             if mid is None:
                 return None
+            if init_fv_key not in ema_state:
+                ema_state[init_fv_key] = mid
+                ema_state[init_ts_key] = float(timestamp)
+            return ema_state[init_fv_key] + slope * (timestamp - ema_state[init_ts_key])
 
-            spread = self.get_spread(order_depth)
-
-            # L2 microprice only during wide spread (>= 10).
-            # During tight spread it blows up (std 6.15 vs 0.35).
-            if spread is not None and spread >= 10:
-                mp_l2 = self.micro_dev_l2(order_depth)
-                fv = mp_l2 if mp_l2 is not None else mid
-            else:
-                fv = mid
-
-        if fv is None:
+        # EMA of mid-price
+        mid = self.raw_mid(order_depth)
+        if mid is None:
             return None
+        alpha    = cfg.get("ema_alpha", 1.0)
+        prev_ema = ema_state.get(product, mid)
+        ema      = alpha * mid + (1 - alpha) * prev_ema
+        ema_state[product] = ema
+        return ema
 
-        # Inventory skew on FV for EMERALDS only.
-        # TOMATOES skew is handled via asymmetric quoting in run().
-        if product == "EMERALDS":
-            if abs(position) < 40:
-                skew = 0.0
-            elif abs(position) < 60:
-                skew = 0.05 * position
-            else:
-                skew = 0.2 * position
-            fv -= skew
+    # ── Order-generation helpers ──────────────────────────────────────────────
 
-        return fv
+    def take_orders(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        fv: float,
+        buy_capacity: int,
+        sell_capacity: int,
+    ) -> Tuple[List[Order], int, int]:
+        """Aggressive taking: lift asks below FV, hit bids above FV."""
+        orders: List[Order] = []
+
+        for ask_price in sorted(order_depth.sell_orders.keys()):
+            if ask_price >= fv or buy_capacity <= 0:
+                break
+            qty = min(buy_capacity, abs(order_depth.sell_orders[ask_price]))
+            if qty > 0:
+                orders.append(Order(product, ask_price, qty))
+                buy_capacity -= qty
+
+        for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
+            if bid_price <= fv or sell_capacity <= 0:
+                break
+            qty = min(sell_capacity, order_depth.buy_orders[bid_price])
+            if qty > 0:
+                orders.append(Order(product, bid_price, -qty))
+                sell_capacity -= qty
+
+        return orders, buy_capacity, sell_capacity
+
+    def make_orders(
+        self,
+        product: str,
+        order_depth: OrderDepth,
+        base_fv: float,
+        skewed_fv: float,
+        buy_capacity: int,
+        sell_capacity: int,
+        max_qty: int,
+        fv_spread: Optional[int],
+        quote_offset: int,
+    ) -> List[Order]:
+        """
+        Passive making.
+        If fv_spread is set: quote at base_fv +/- fv_spread (FV-anchored levels).
+        Otherwise: quote quote_offset ticks outside the best bid/ask.
+        In both cases, orders are only posted on the correct side of skewed_fv.
+        """
+        orders: List[Order] = []
+        fv_int = int(round(base_fv))
+
+        if fv_spread is not None:
+            # FV-anchored quotes
+            bid_price = fv_int - fv_spread
+            ask_price = fv_int + fv_spread
+        else:
+            best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else fv_int - 2
+            best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else fv_int + 2
+            bid_price = best_bid - quote_offset
+            ask_price = best_ask + quote_offset
+
+        if buy_capacity > 0 and bid_price < skewed_fv:
+            orders.append(Order(product, bid_price, min(buy_capacity, max_qty)))
+
+        if sell_capacity > 0 and ask_price > skewed_fv:
+            orders.append(Order(product, ask_price, -min(sell_capacity, max_qty)))
+
+        return orders
+
+    # ── Main entry point ──────────────────────────────────────────────────────
 
     def run(self, state: TradingState):
+        try:
+            ema_state: Dict[str, float] = json.loads(state.traderData) if state.traderData else {}
+        except (json.JSONDecodeError, TypeError):
+            ema_state = {}
+
         result = {}
 
         for product in state.order_depths:
-            order_depth: OrderDepth = state.order_depths[product]
+            order_depth = state.order_depths[product]
             orders: List[Order] = []
 
-            position = state.position.get(product, 0)
-            limit = POSITION_LIMITS.get(product, DEFAULT_LIMIT)
+            cfg          = PRODUCT_CONFIG.get(product, {})
+            limit        = cfg.get("limit", DEFAULT_LIMIT)
+            tiers        = cfg.get("skew_tiers", [(DEFAULT_LIMIT, 0.0)])
+            quote_offset = cfg.get("quote_offset", 0)
+            fv_spread    = cfg.get("fv_spread", None)
+            max_passive  = cfg.get("max_passive_qty", limit)
+            position     = state.position.get(product, 0)
 
-            fv = self.get_fair_value(product, order_depth, position)
-            if fv is None:
+            base_fv = self.get_base_fv(product, order_depth, ema_state, state.timestamp)
+            if base_fv is None:
                 result[product] = orders
                 continue
 
-            buy_capacity = limit - position
+            sf        = self.skew_factor(position, tiers)
+            skewed_fv = base_fv - sf * position
+
+            buy_capacity  = limit - position
             sell_capacity = limit + position
 
-            if not order_depth.buy_orders or not order_depth.sell_orders:
-                result[product] = orders
-                continue
+            # Step 1 – Aggressive taking (uses skewed FV)
+            taken, buy_capacity, sell_capacity = self.take_orders(
+                product, order_depth, skewed_fv, buy_capacity, sell_capacity
+            )
+            orders.extend(taken)
 
-            best_bid = max(order_depth.buy_orders.keys())
-            best_ask = min(order_depth.sell_orders.keys())
-            spread = best_ask - best_bid
-            is_wide = spread >= 10
-
-            # ── Step 1: Taking (Aggressive) ───────────────────────────
-            #
-            # Wide spread: take freely when price crosses FV.
-            # Tight spread: take ONLY to unwind inventory.
-            #   If we're short, we can lift asks below FV (buy to cover).
-            #   If we're long, we can hit bids above FV (sell to flatten).
-            #   Never take in the direction that worsens inventory.
-
-            if product == "EMERALDS" or is_wide:
-                # Full taking in both directions
-                for ask_price in sorted(order_depth.sell_orders.keys()):
-                    if ask_price > fv or buy_capacity <= 0:
-                        break
-                    vol = abs(order_depth.sell_orders[ask_price])
-                    qty = min(buy_capacity, vol)
-                    if qty > 0:
-                        orders.append(Order(product, ask_price, qty))
-                        buy_capacity -= qty
-
-                for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                    if bid_price < fv or sell_capacity <= 0:
-                        break
-                    vol = order_depth.buy_orders[bid_price]
-                    qty = min(sell_capacity, vol)
-                    if qty > 0:
-                        orders.append(Order(product, bid_price, -qty))
-                        sell_capacity -= qty
-
-            elif product == "TOMATOES":
-                # Tight spread: only take to unwind
-                if position < 0:
-                    # Short -> buy to cover
-                    for ask_price in sorted(order_depth.sell_orders.keys()):
-                        if ask_price > fv or buy_capacity <= 0:
-                            break
-                        vol = abs(order_depth.sell_orders[ask_price])
-                        qty = min(buy_capacity, vol, abs(position))
-                        if qty > 0:
-                            orders.append(Order(product, ask_price, qty))
-                            buy_capacity -= qty
-
-                elif position > 0:
-                    # Long -> sell to flatten
-                    for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-                        if bid_price < fv or sell_capacity <= 0:
-                            break
-                        vol = order_depth.buy_orders[bid_price]
-                        qty = min(sell_capacity, vol, position)
-                        if qty > 0:
-                            orders.append(Order(product, bid_price, -qty))
-                            sell_capacity -= qty
-
-            # ── Step 2: Making (Passive) ──────────────────────────────
-            #
-            # Default: conservative bid+1 / ask-1 (proven profitable).
-            #
-            # Asymmetric inventory management for TOMATOES:
-            #   The UNWINDING side quotes more aggressively based on
-            #   inventory level, while the accumulating side stays at
-            #   bid+1 / ask-1.
-            #
-            #   |pos| < 40:  both sides at bid+1 / ask-1 (pure MM)
-            #   |pos| 40-63: unwinding side moves to FV ± 3
-            #   |pos| > 63:  unwinding side quotes AT fair value
-            #
-            # Tight spread cap always applies (min/max with bid+1/ask-1)
-            # to prevent microprice blowup from crossing the book.
-
-            conservative_bid = best_bid + 1
-            conservative_ask = best_ask - 1
-
-            if product == "TOMATOES":
-                abs_pos = abs(position)
-
-                if abs_pos <= 63:
-                    # Pure MM: symmetric conservative
-                    our_bid = conservative_bid
-                    our_ask = conservative_ask
-
-                elif abs_pos <= 39:
-                    # Moderate inventory: unwinding side at FV ± 3
-                    if position > 0:
-                        # Long: ask aggressively, bid conservatively
-                        our_bid = conservative_bid
-                        our_ask = int(fv) + 3
-                    else:
-                        # Short: bid aggressively, ask conservatively
-                        our_bid = int(fv) - 3
-                        our_ask = conservative_ask
-
-                else:
-                    # Critical inventory (>63): unwinding side as close
-                    # to fair value as possible while staying live.
-                    # ceil(fv) for asks guarantees ask > fv when fv is
-                    # not an integer; floor(fv) + 1 when it is.
-                    if position > 0:
-                        our_bid = conservative_bid
-                        our_ask = math.ceil(fv) if fv != int(fv) else int(fv) + 1
-                    else:
-                        our_bid = math.floor(fv) if fv != int(fv) else int(fv) - 1
-                        our_ask = conservative_ask
-
-                # Tight spread cap: never more aggressive than bid+1/ask-1
-                if not is_wide:
-                    our_bid = min(our_bid, conservative_bid)
-                    our_ask = max(our_ask, conservative_ask)
-
-                # Floor: never quote behind the bots
-                our_bid = max(our_bid, best_bid)
-                our_ask = min(our_ask, best_ask)
-
-            else:
-                # EMERALDS: conservative with FV cap
-                fv_bid = int(fv) - 1
-                fv_ask = int(fv) + 1
-                our_bid = min(conservative_bid, fv_bid)
-                our_ask = max(conservative_ask, fv_ask)
-
-            # Safety: don't cross the book
-            if our_bid >= best_ask:
-                our_bid = best_bid
-            if our_ask <= best_bid:
-                our_ask = best_ask
-
-            # Place orders if on correct side of FV
-            if buy_capacity > 0 and our_bid < fv:
-                orders.append(Order(product, our_bid, buy_capacity))
-
-            if sell_capacity > 0 and our_ask > fv:
-                orders.append(Order(product, our_ask, -sell_capacity))
+            # Step 2 – Passive making
+            orders.extend(self.make_orders(
+                product, order_depth, base_fv, skewed_fv,
+                buy_capacity, sell_capacity,
+                max_passive, fv_spread, quote_offset,
+            ))
 
             result[product] = orders
 
-        traderData = "V4_SKEW_FIX"
-        conversions = 0
-        return result, conversions, traderData
+        return result, 0, json.dumps(ema_state)

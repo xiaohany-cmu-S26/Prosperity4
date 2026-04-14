@@ -61,8 +61,18 @@ def load_algo(algo_path: Path):
     if not hasattr(mod, "Trader"):
         raise AttributeError(f"{algo_path} has no Trader class")
 
-    position_limits = getattr(mod, "POSITION_LIMITS", {})
     default_limit = getattr(mod, "DEFAULT_LIMIT", DEFAULT_POSITION_LIMIT)
+
+    # Support both legacy POSITION_LIMITS dict and the new PRODUCT_CONFIG dict.
+    if hasattr(mod, "POSITION_LIMITS"):
+        position_limits = mod.POSITION_LIMITS
+    elif hasattr(mod, "PRODUCT_CONFIG"):
+        position_limits = {
+            product: cfg.get("limit", default_limit)
+            for product, cfg in mod.PRODUCT_CONFIG.items()
+        }
+    else:
+        position_limits = {}
 
     return mod.Trader, position_limits, default_limit
 
@@ -211,13 +221,16 @@ class BacktestResult:
 def find_data_file(
     data_dir: Path, round_num: int, day_num: int, prefix: str
 ) -> Optional[Path]:
-    """Try flat layout first, then P3-style subdirectory layout."""
-    flat = data_dir / f"{prefix}_round_{round_num}_day_{day_num}.csv"
+    """Try flat layout first, then common subdirectory name conventions."""
+    filename = f"{prefix}_round_{round_num}_day_{day_num}.csv"
+    flat = data_dir / filename
     if flat.is_file():
         return flat
-    nested = data_dir / f"round{round_num}" / f"{prefix}_round_{round_num}_day_{day_num}.csv"
-    if nested.is_file():
-        return nested
+    # Check both lowercase and uppercase subdirectory conventions
+    for subdir_name in (f"round{round_num}", f"ROUND{round_num}"):
+        nested = data_dir / subdir_name / filename
+        if nested.is_file():
+            return nested
     return None
 
 
@@ -247,15 +260,16 @@ def detect_days(data_dir: Path, round_num: int) -> List[int]:
             if m:
                 days.append(int(m.group(1)))
 
-    # Scan nested layout
-    nested = data_dir / f"round{round_num}"
-    if nested.is_dir():
-        for f in nested.iterdir():
-            m = pattern.match(f.name)
-            if m:
-                d = int(m.group(1))
-                if d not in days:
-                    days.append(d)
+    # Scan nested layout (both lowercase and uppercase conventions)
+    for subdir_name in (f"round{round_num}", f"ROUND{round_num}"):
+        nested = data_dir / subdir_name
+        if nested.is_dir():
+            for f in nested.iterdir():
+                m = pattern.match(f.name)
+                if m:
+                    d = int(m.group(1))
+                    if d not in days:
+                        days.append(d)
 
     return sorted(days)
 
@@ -904,14 +918,14 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="TUTORIAL_ROUND_1",
-        help="Path to data directory (default: TUTORIAL_ROUND_1)",
+        default="ROUND_1",
+        help="Path to data directory (default: ROUND_1)",
     )
     parser.add_argument(
         "--round",
         type=int,
-        default=0,
-        help="Round number (default: 0)",
+        default=1,
+        help="Round number (default: 1)",
     )
     parser.add_argument(
         "--day",
