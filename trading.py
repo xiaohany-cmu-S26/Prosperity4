@@ -23,10 +23,11 @@ PRODUCT_CONFIG = {
             (60, 0.05),  # |pos| <  60  -> light inventory skew
             (80, 0.2),   # |pos| >= 60  -> aggressive inventory clear
         ],
-        # Join the best bid/ask (quote_offset=0) — structural MMs sit at
-        # FV ± 6.5–7.5; joining their queue earns ~13 ticks/round-trip and
-        # keeps fills symmetric in the trending market.
-        "quote_offset": 0,
+        # Post 1 tick inside the best bid/ask (quote_offset=-1 → bid=best_bid+1,
+        # ask=best_ask-1). Structural MMs rest at best_bid/best_ask with queue
+        # priority; posting inside gives us queue priority over them.
+        # Spread is typically ~13 ticks, so 11-tick round-trip is still profitable.
+        "quote_offset": -1,
         "max_passive_qty": 10,
     },
     "ASH_COATED_OSMIUM": {
@@ -37,10 +38,11 @@ PRODUCT_CONFIG = {
         "skew_tiers": [
             (80, 0.1),   # flat skew across all positions
         ],
-        # Post passive quotes at fixed levels 7 ticks from FV (just inside the
-        # structural market makers who post at ±8). This earns 14 ticks/round-trip
-        # and gets priority over the bots anchored at ±8.
-        "fv_spread": 7,
+        # Post passive quotes at fixed levels 6 ticks from FV (bid=9994, ask=10006).
+        # Structural MMs anchor at ±7 (9993/10007); posting at ±6 puts us 1 tick
+        # inside, giving queue priority. Also captures compressed-market asks at
+        # 10006 that the previous ±7 quote missed entirely.
+        "fv_spread": 6,
         "max_passive_qty": 12,
     },
 }

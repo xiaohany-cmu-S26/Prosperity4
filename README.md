@@ -15,44 +15,39 @@ Market-making bot for IMC's Prosperity 4 tournament.
 
 ## Strategy
 
-### Fair Value: Microprice Deviation L2
+Each product is configured via `PRODUCT_CONFIG` in `trading.py`. The algo has two phases per tick:
 
-Uses second-level order book data to estimate fair value:
+1. **Aggressive taking** — lift any ask below `skewed_fv`, hit any bid above `skewed_fv`
+2. **Passive making** — post resting quotes on both sides of `skewed_fv`
 
-```
-FV = (bid_price_2 × ask_volume_2 + ask_price_2 × bid_volume_2) / (bid_volume_2 + ask_volume_2)
-```
+### Fair Value
 
-This is only used when the spread is wide (≥ 10 ticks). During tight spreads, the simple mid price is used instead — L2 microprice has high variance in tight regimes (std 6.15 vs 0.35).
+| Product | Method | Detail |
+|---------|--------|--------|
+| `INTARIAN_PEPPER_ROOT` | `linear_trend` | Anchors to first observed mid each day, then extrapolates at +0.001/timestamp |
+| `ASH_COATED_OSMIUM` | Fixed float | Hardcoded at 10000 (strong mean reversion, lag-1 autocorr ≈ −0.49) |
 
-### Spread Regime Detection
+### Passive Quote Placement
 
-The algorithm behaves differently based on spread width:
+**`quote_offset` (book-relative):** quote at `best_bid − offset` / `best_ask + offset`.  
+Negative offset (e.g. `−1`) posts *inside* the spread, giving queue priority over resting structural MMs.
 
-**Wide spread (≥ 10 ticks):**
-- Full aggressive taking in both directions when price crosses FV
-- L2 microprice for fair value
+**`fv_spread` (FV-relative):** quote at `FV ± spread` regardless of the book.  
+Used when structural MMs anchor at a known fixed distance from FV, so we can undercut them.
 
-**Tight spread (< 10 ticks):**
-- Aggressive taking only to unwind existing inventory (never adds to position)
-- Simple mid price for fair value
+| Product | Quote mode | Value | Rationale |
+|---------|-----------|-------|-----------|
+| `INTARIAN_PEPPER_ROOT` | `quote_offset` | `−1` | Post 1 tick inside best bid/ask for queue priority; typical ~13-tick spread → 11-tick round-trip |
+| `ASH_COATED_OSMIUM` | `fv_spread` | `6` | Structural MMs at ±7 (9993/10007); ±6 undercuts them and captures compressed-market asks |
 
-### Inventory Management
+### Inventory Skew
 
-**EMERALDS:** FV skew based on position size:
-- `|pos| < 40`: no skew
-- `|pos| 40–60`: FV shifted by `0.05 × position`
-- `|pos| > 60`: FV shifted by `0.2 × position`
+Both products use `skew_tiers`: at each tier, `skewed_fv = base_fv − skew_factor × position`. Aggressive taking and passive quote filtering both use `skewed_fv`, biasing the algo toward reducing large positions.
 
-**TOMATOES:** Asymmetric quoting — the unwinding side quotes more aggressively:
-- `|pos| ≤ 63`: symmetric conservative (bid+1 / ask-1)
-- `|pos| > 63`: unwinding side quotes at fair value
-
-### Making (Passive Quotes)
-
-- Default: post at `best_bid + 1` / `best_ask - 1`
-- EMERALDS: capped by `FV ± 1` to avoid quoting through fair value
-- Safety checks prevent crossing the book
+| Product | Tiers |
+|---------|-------|
+| `INTARIAN_PEPPER_ROOT` | `\|pos\| < 40`: 0.0 · `\|pos\| < 60`: 0.05 · else: 0.2 |
+| `ASH_COATED_OSMIUM` | flat 0.1 across all positions |
 
 ## Backtester
 
@@ -121,14 +116,18 @@ Features:
 
 ## Configuration
 
-Key constants in `trading.py`:
+All per-product tuning is in `PRODUCT_CONFIG` at the top of `trading.py`. Key fields:
 
-```python
-EMERALD_FAIR_VALUE = 10000
-POSITION_LIMITS = {"EMERALDS": 80, "TOMATOES": 80}
-DEFAULT_LIMIT = 80
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Position limit (long and short) |
+| `fair_value` | float \| `"linear_trend"` \| `"midwall"` | FV method |
+| `trend_slope` | float | Used by `linear_trend` — FV increment per timestamp unit |
+| `skew_tiers` | list of `(threshold, factor)` | Inventory skew ladder |
+| `quote_offset` | int | Ticks outside best bid/ask (`−1` = 1 tick inside) |
+| `fv_spread` | int | Fixed ticks from FV for passive quotes (overrides `quote_offset`) |
+| `max_passive_qty` | int | Max units per passive order |
 
 ---
 
-Last updated: March 2026
+Last updated: April 2026
