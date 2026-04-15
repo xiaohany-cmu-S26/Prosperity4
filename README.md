@@ -1,174 +1,135 @@
 # Prosperity 4 Trading Algorithm
 
-Market-making and arbitrage bot for IMC's Prosperity 4 tournament, with aggressive liquidity-providing strategies.
-
-## Overview
-
-This codebase implements a multi-product trading algorithm that:
-- **Market makes** on multiple products (EMERALDS, TOMATOES) using Wall Mid fair value estimation
-- **Manages inventory** by detecting skewed positions and forcing reversion trades
-- **Aggressively liquidity-provides** in tight spreads while queue-beating in wider spreads
-- **Prevents losses** by validating all trades against fair value before execution
+Market-making bot for IMC's Prosperity 4 tournament.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `trading.py` | Main trading algorithm with market making logic |
-| `trading_emerald_band.py` | Alternative EMERALDS-only strategy with fixed bid/ask bands |
-| `visualize_log.py` | Parse and visualize trade logs with interactive charts |
-| `read_log.py` | Utility to inspect raw trade data |
-| `datamodel.py` | Trade state and order data structures |
-| `logs/` | Historical runs and trade visualizations |
+| `trading.py` | Main trading algorithm |
+| `backtest.py` | Local backtester — replays tutorial round data through any algo file |
+| `visualize_log.py` | Interactive chart generation from trade logs |
+| `datamodel.py` | IMC Prosperity data structures (OrderDepth, TradingState, etc.) |
+| `TUTORIAL_ROUND_1/` | Tutorial round market data (prices + trades CSVs) |
+| `logs/` | Trade logs, backtest CSVs, and HTML visualizations |
 
 ## Strategy
 
-### Fair Value Estimation: Wall Mid
+Each product is configured via `PRODUCT_CONFIG` in `trading.py`. The algo has two phases per tick:
 
-The algorithm estimates true underlying price using **Wall Mid**:
-- **Bid Wall** = the price level with highest buy volume
-- **Ask Wall** = the price level with highest sell volume
-- **Wall Mid** = (Bid Wall + Ask Wall) / 2
+1. **Aggressive taking** — lift any ask below `skewed_fv`, hit any bid above `skewed_fv`
+2. **Passive making** — post resting quotes on both sides of `skewed_fv`
 
-This is more stable than raw mid price because market makers quote at the walls, not at overbids/undercuts.
+### Fair Value
 
-### Three Trading Steps
+| Product | Method | Detail |
+|---------|--------|--------|
+| `INTARIAN_PEPPER_ROOT` | `linear_trend` | Anchors to first observed mid each day, then extrapolates at +0.001/timestamp |
+| `ASH_COATED_OSMIUM` | Fixed float | Hardcoded at 10000 (strong mean reversion, lag-1 autocorr ≈ −0.49) |
 
-#### Step 1: Take Profitable Quotes
-- Buy all asks **strictly below** Wall Mid
-- Sell all bids **strictly above** Wall Mid
-- Prevents taking trades at a loss
-- Runs regardless of inventory state
+### Passive Quote Placement
 
-#### Step 2a: Inventory Reversion (Skewed Position)
-When `|position| > SKEW_THRESHOLD`:
-- **Too long** (position > 0): Post ask at Wall Mid to encourage selling
-- **Too short** (position < 0): Post bid at Wall Mid to encourage buying
-- Prevents building extreme inventory imbalances
+**`quote_offset` (book-relative):** quote at `best_bid − offset` / `best_ask + offset`.  
+Negative offset (e.g. `−1`) posts *inside* the spread, giving queue priority over resting structural MMs.
 
-Per-product thresholds (configured in `SKEW_THRESHOLDS`):
-```python
-SKEW_THRESHOLDS: dict[str, int] = {
-    "EMERALDS": 68,
-    "TOMATOES": 30,
-}
+**`fv_spread` (FV-relative):** quote at `FV ± spread` regardless of the book.  
+Used when structural MMs anchor at a known fixed distance from FV, so we can undercut them.
+
+| Product | Quote mode | Value | Rationale |
+|---------|-----------|-------|-----------|
+| `INTARIAN_PEPPER_ROOT` | `quote_offset` | `−1` | Post 1 tick inside best bid/ask for queue priority; typical ~13-tick spread → 11-tick round-trip |
+| `ASH_COATED_OSMIUM` | `fv_spread` | `6` | Structural MMs at ±7 (9993/10007); ±6 undercuts them and captures compressed-market asks |
+
+### Inventory Skew
+
+Both products use `skew_tiers`: at each tier, `skewed_fv = base_fv − skew_factor × position`. Aggressive taking and passive quote filtering both use `skewed_fv`, biasing the algo toward reducing large positions.
+
+| Product | Tiers |
+|---------|-------|
+| `INTARIAN_PEPPER_ROOT` | `\|pos\| < 40`: 0.0 · `\|pos\| < 60`: 0.05 · else: 0.2 |
+| `ASH_COATED_OSMIUM` | flat 0.1 across all positions |
+
+## Backtester
+
+Adapted from [jmerle/imc-prosperity-3-backtester](https://github.com/jmerle/imc-prosperity-3-backtester) for Prosperity 4. Replays tutorial round CSV data through any algo's `Trader.run()` with a two-phase matching engine:
+
+1. **Order depth matching**: orders that cross the current book fill immediately at the book price
+2. **Market trade matching**: remaining unfilled volume is matched against historical market trades at favorable prices
+
+Trade matching mode controls phase 2: `all` (default) matches trades at prices equal to or better than your quote, `worse` only matches strictly better prices, `none` skips market trade matching entirely.
+
+### Usage
+
+```bash
+# Run default algo (trading.py) on all available days
+python3 backtest.py
+
+# Run a specific algo file
+python3 backtest.py --algo my_strat.py
+
+# Single day
+python3 backtest.py --day -1
+
+# Stricter matching (only match market trades at worse prices)
+python3 backtest.py --match-trades worse
+
+# Print trader stdout while running
+python3 backtest.py --print
+
+# Custom data directory and round
+python3 backtest.py --data ROUND_1 --round 1
+
+# Skip saving output
+python3 backtest.py --no-out
+
+# Merge PnL across days
+python3 backtest.py --merge-pnl
 ```
 
-#### Step 2b: Market Making (Normal Inventory)
-When inventory is within thresholds:
+### Output
 
-**Wide spreads (≥3 ticks):**
-- Post bid at `best_bid + 1`, ask at `best_ask - 1` (queue-beating)
-- Full remaining capacity on each side
-- Attempt to capture wide spreads
+The backtester writes two files to `logs/`:
+- `backtest_{algo}.json` — JSON format compatible with `visualize_log.py`
+- `backtest_{algo}.log` — P3-style log format (Sandbox logs / Activities log / Trade History)
 
-**Tight spreads (<3 ticks):**
-- Post both bid and ask at Wall Mid with half capacity
-- Acts as liquidity provider when market is efficient
-- Higher fill probability
+### Algo File Requirements
 
-### Loss Prevention
+Any `.py` file with:
+- A `Trader` class with a `run(state: TradingState)` method returning `(orders, conversions, traderData)`
+- Optional `POSITION_LIMITS` dict and `DEFAULT_LIMIT` int (defaults to 80)
 
-All trades are validated:
-- Takes: `ask_price < FV` (buy) and `bid_price > FV` (sell)
-- Quotes: `our_bid < FV` and `our_ask > FV`
-- Skew reversion: Rounding safe to avoid fractional FV losses
+## Visualizer
 
-Rejected trades are logged with reason for debugging.
+```bash
+# Dashboard with all logs (dropdown selector)
+python3 visualize_log.py
+
+# Single log visualization
+python3 visualize_log.py --log 3179/3179
+```
+
+Features:
+- Order book depth, spread, and price charts per product
+- Price y-axis auto-scaled to the data: centered on the median, depth set from the P1–P99 price range (outlier spikes are ignored)
+- **Price depth** input in the toolbar — type a tick count to zoom the price axis in or out uniformly across all product charts
+- PnL with inventory overlay (secondary y-axis)
+- Total PnL trace across products
+- Dynamic sidebar metrics (PnL, positions, trade counts) that update as you zoom/pan the x-axis
 
 ## Configuration
 
-Edit `trading.py` constants:
+All per-product tuning is in `PRODUCT_CONFIG` at the top of `trading.py`. Key fields:
 
-```python
-POSITION_LIMIT = 80                    # Max position long/short per product
-MIDWALL_TOP_N = 3                      # (unused, kept for reference)
-DEFAULT_SKEW_THRESHOLD = 40            # Default inventory reversion threshold
-SKEW_THRESHOLDS = {...}                # Per-product overrides
-```
-
-## Running
-
-### View Trade Results
-```bash
-# Generate interactive chart for a single run
-python visualize_log.py --log 3179/3179
-
-# Generate dashboard with all runs (dropdown to switch)
-python visualize_log.py
-
-# Open in browser (automatic)
-```
-
-### Inspect Trade Data
-```bash
-python read_log.py
-```
-
-## Logs
-
-Trade data is stored in `logs/`:
-- `.json`: Structured activities and trades
-- `.log`: Full trade history
-- `.html`: Interactive visualizations
-
-Run ID is typically `<timestamp>_<timestamp>`.
-
-## Key Metrics
-
-When analyzing runs, look for:
-- **Total PnL**: Sum of final PnL across all products
-- **Trade count**: Higher ≠ better (quality > quantity)
-- **PnL by product**: Evaluate each separately (different market regimes)
-- **Position at end**: Should be near 0 (inventory managed well)
-
-## Alternative Strategies
-
-### Fixed Band Strategy (EMERALDS only)
-See `trading_emerald_band.py` for a simpler mean-reversion strategy:
-- Buy if ask ≤ 9992
-- Sell if bid ≥ 10008
-- Post passive quotes at band edges
-
-Good for:
-- Testing specific price levels
-- Hedging specific inventory targets
-- Comparing against dynamic Wall Mid approach
-
-## Tuning Guide
-
-Start with these levers:
-
-1. **Spread check threshold** (line ~124): Change `< 3` to adjust aggressive quoting
-2. **Skew thresholds** (lines 10-13): Lower = more aggressive inventory reversion
-3. **Quote size in tight spreads** (line 126): Adjust `// 2` to control position risk
-4. **MIDWALL_TOP_N** (line 5): If using weighted wall, adjust levels considered
-
-Run backtests after each change to measure impact.
-
-## Common Issues
-
-### No trades executed
-- Check spread is positive (best_ask > best_bid)
-- Verify fair value is reasonable relative to market prices
-- Look for "REJECT" logs indicating loss prevention
-
-### Excessive inventory
-- Lower `SKEW_THRESHOLD` to force reversion sooner
-- Increase quote size in normal quoting block
-- Check if one side of market is consistently stale
-
-### Zero PnL despite trades
-- Verify entry and exit prices balance
-- Check for position unwinds at bad prices
-- Ensure Wall Mid is stable (not whipsawing)
-
-## References
-
-- **Wall Mid concept**: IMC Prosperity official documentation
-- **Market making basics**: See recommendations in code comments
-- **Inventory management**: Standard market maker risk control
+| Field | Type | Description |
+|-------|------|-------------|
+| `limit` | int | Position limit (long and short) |
+| `fair_value` | float \| `"linear_trend"` \| `"midwall"` | FV method |
+| `trend_slope` | float | Used by `linear_trend` — FV increment per timestamp unit |
+| `skew_tiers` | list of `(threshold, factor)` | Inventory skew ladder |
+| `quote_offset` | int | Ticks outside best bid/ask (`−1` = 1 tick inside) |
+| `fv_spread` | int | Fixed ticks from FV for passive quotes (overrides `quote_offset`) |
+| `max_passive_qty` | int | Max units per passive order |
 
 ---
 
-Last updated: March 2026
+Last updated: April 2026

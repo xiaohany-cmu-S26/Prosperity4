@@ -24,6 +24,9 @@ from plotly.subplots import make_subplots
 
 from visualize_log import (
     LOG_DIR,
+    VIZ_DIR,
+    BID_COLOR,
+    ASK_COLOR,
     list_log_files,
     load_log,
     build_volume_summary,
@@ -159,15 +162,15 @@ def build_chart_dev(data: dict, log_label: str) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=df["timestamp"], y=df["bid_price_1"],
             name=f"{product} bid",
-            line=dict(color=color, width=0.8, dash="dot"),
-            opacity=0.45, legendgroup=product, showlegend=False,
+            line=dict(color=BID_COLOR, width=0.8, dash="dot"),
+            opacity=0.6, legendgroup=product, showlegend=False,
         ), row=row, col=1, secondary_y=False)
 
         fig.add_trace(go.Scatter(
             x=df["timestamp"], y=df["ask_price_1"],
             name=f"{product} ask",
-            line=dict(color=color, width=0.8, dash="dot"),
-            opacity=0.45, fill="tonexty", fillcolor=to_rgba(color, 0.08),
+            line=dict(color=ASK_COLOR, width=0.8, dash="dot"),
+            opacity=0.6, fill="tonexty", fillcolor=to_rgba(BID_COLOR, 0.07),
             legendgroup=product, showlegend=False,
         ), row=row, col=1, secondary_y=False)
 
@@ -328,7 +331,7 @@ def main() -> None:
         data = load_log(logs[args.log])
         fig = build_chart_dev(data, args.log)
         default_name = f"{safe_file_name(args.log)}_viz_dev.html"
-        output = Path(args.output) if args.output else LOG_DIR / default_name
+        output = Path(args.output) if args.output else VIZ_DIR / default_name
         output.parent.mkdir(parents=True, exist_ok=True)
         fig.write_html(str(output), include_plotlyjs="cdn", auto_open=not args.no_open)
         print(f"Saved: {output}")
@@ -342,7 +345,7 @@ def main() -> None:
         figures[log_key] = fig.to_plotly_json()
         summaries[log_key] = build_volume_summary(data)
 
-    output = Path(args.output) if args.output else LOG_DIR / "viz_dashboard_dev.html"
+    output = Path(args.output) if args.output else VIZ_DIR / "viz_dashboard_dev.html"
     build_dashboard_html(figures, summaries, output)
     print(f"Saved dashboard: {output}")
     if not args.no_open:
