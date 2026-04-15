@@ -27,8 +27,10 @@ PRODUCT_CONFIG = {
         # ask=best_ask-1). Structural MMs rest at best_bid/best_ask with queue
         # priority; posting inside gives us queue priority over them.
         # Spread is typically ~13 ticks, so 11-tick round-trip is still profitable.
+        # max_passive_qty=20: structural MM resting volume peaks at 25; with
+        # queue priority (posting inside) we can now fill larger incoming orders.
         "quote_offset": -1,
-        "max_passive_qty": 10,
+        "max_passive_qty": 20,
     },
     "ASH_COATED_OSMIUM": {
         "limit": 80,

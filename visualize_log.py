@@ -336,8 +336,30 @@ def build_chart(data: dict, log_label: str) -> tuple[go.Figure, dict]:
         barmode="overlay",
     )
 
+    # Compute per-product price ranges: center on the median, depth uses the
+    # 1st–99th percentile range to ignore rare spike outliers (e.g. erroneous 0-prices).
+    price_data: dict[str, dict] = {}
+    price_layout_update: dict = {}
+    for i, product in enumerate(products):
+        df = acts[acts["product"] == product]
+        mid = df["mid_price"].dropna()
+        if not mid.empty:
+            center = float(mid.median())
+            p01 = float(mid.quantile(0.01))
+            p99 = float(mid.quantile(0.99))
+            data_range = max(p99 - p01, 1.0)
+            padding = max(data_range * 0.10, 5.0)   # 10 % padding, min 5 ticks each side
+            depth = max(data_range + 2 * padding, 20.0)
+        else:
+            center, depth = 0.0, 100.0
+        price_data[product] = {"center": center, "depth": depth}
+        yaxis_key = "yaxis" if i == 0 else f"yaxis{2 * i + 1}"
+        price_layout_update[f"{yaxis_key}.range"] = [center - depth / 2, center + depth / 2]
+        price_layout_update[f"{yaxis_key}.autorange"] = False
+    fig.update_layout(**price_layout_update)
+
     statesheet = build_statesheet(data)
-    return fig, statesheet
+    return fig, statesheet, price_data
 
 
 def _final_unrealized_pnl(product_trades: pd.DataFrame, final_mid: float) -> float:
@@ -566,7 +588,7 @@ def build_raw_timeseries(data: dict) -> dict:
     return {"timeseries": timeseries, "trades": trade_list}
 
 
-def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict], raw_ts: dict, log_label: str, output_path: Path) -> None:
+def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict], raw_ts: dict, price_data: dict, log_label: str, output_path: Path) -> None:
     """Build HTML for a single log with sidebar stats."""
     import numpy as np
 
@@ -581,6 +603,8 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
     statesheet_json = json.dumps(statesheet)
     summary_json = json.dumps(summary)
     raw_ts_json = json.dumps(raw_ts, default=json_serializer)
+    price_data_json = json.dumps(price_data)
+    initial_depth = max(round(v["depth"] / 10) * 10 for v in price_data.values()) if price_data else 100
 
     html = f"""<!doctype html>
 <html lang=\"en\">
@@ -608,6 +632,10 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
 <body>
   <div class=\"toolbar\">
     <h2 style=\"margin:0; font-size:16px;\">IMC Prosperity — {log_label}</h2>
+    <label for=\"priceDepthInput\" style=\"font-size:12px; color:#aaa; margin-left:20px;\">Price depth:</label>
+    <input type=\"number\" id=\"priceDepthInput\" value=\"{initial_depth}\" min=\"1\" step=\"10\"
+      style=\"width:72px; background:#222; color:#eee; border:1px solid #444; padding:3px 6px; border-radius:4px; font-size:12px;\" />
+    <span style=\"font-size:11px; color:#666;\">ticks</span>
   </div>
   <div class=\"container\">
     <div id=\"chart\"></div>
@@ -643,7 +671,38 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
   <script>
     const figure = {fig_json};
     const rawTs = {raw_ts_json};
+    const priceData = {price_data_json};
     const chart = document.getElementById('chart');
+
+    // Price depth widget — y-axis key for product at sorted index i follows
+    // Plotly's secondary_y subplot convention: row k → yaxis(2k-1) for primary.
+    // Products are 0-indexed in sorted order, so row = i+1.
+    let applyingPriceDepth = false;
+
+    function getPriceYAxisKey(sortedIndex) {{
+        return sortedIndex === 0 ? 'yaxis' : `yaxis${{2 * sortedIndex + 1}}`;
+    }}
+
+    // depth=null → restore each product's natural (data-fitted) range
+    function applyPriceDepth(depth) {{
+        const products = Object.keys(priceData).sort();
+        if (!products.length) return;
+        const update = {{}};
+        products.forEach((product, i) => {{
+            const info = priceData[product];
+            const half = (depth !== null ? depth : info.depth) / 2;
+            const key = getPriceYAxisKey(i);
+            update[`${{key}}.range`] = [info.center - half, info.center + half];
+            update[`${{key}}.autorange`] = false;
+        }});
+        applyingPriceDepth = true;
+        Plotly.relayout(chart, update);
+    }}
+
+    document.getElementById('priceDepthInput').addEventListener('change', function() {{
+        const depth = parseFloat(this.value);
+        if (depth > 0) applyPriceDepth(depth);
+    }});
 
     // Compute stats for a given timestamp range [tMin, tMax]
     function computeStats(tMin, tMax) {{
@@ -750,6 +809,9 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
 
     // Update sidebar on zoom/pan
     chart.on('plotly_relayout', function(eventData) {{
+        // Skip sidebar update when we triggered this ourselves via price-depth widget
+        if (applyingPriceDepth) {{ applyingPriceDepth = false; return; }}
+
         // Find the x-axis range — shared x-axes mean any xaxis range works
         let tMin = null, tMax = null;
         for (const key of Object.keys(eventData)) {{
@@ -776,10 +838,10 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
 </html>
 """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html)
+    output_path.write_text(html, encoding="utf-8")
 
 
-def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dict]], statesheets: dict[str, dict], all_raw_ts: dict[str, dict], output_path: Path) -> None:
+def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dict]], statesheets: dict[str, dict], all_raw_ts: dict[str, dict], all_price_data: dict[str, dict], output_path: Path) -> None:
     keys = sorted(figures.keys())
     if not keys:
         raise ValueError("No logs available to visualize.")
@@ -795,6 +857,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
 
     fig_json = json.dumps(figures, default=json_serializer)
     all_raw_ts_json = json.dumps(all_raw_ts, default=json_serializer)
+    all_price_data_json = json.dumps(all_price_data, default=json_serializer)
     option_html = "\n".join([f'<option value="{k}">{k}</option>' for k in keys])
 
     html = f"""<!doctype html>
@@ -825,6 +888,10 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
   <div class=\"toolbar\">
     <label for=\"logSelect\">Choose log:</label>
     <select id=\"logSelect\">{option_html}</select>
+    <label for=\"priceDepthInput\" style=\"font-size:12px; color:#aaa; margin-left:16px;\">Price depth:</label>
+    <input type=\"number\" id=\"priceDepthInput\" value=\"100\" min=\"1\" step=\"10\"
+      style=\"width:72px; background:#222; color:#eee; border:1px solid #444; padding:3px 6px; border-radius:4px; font-size:12px;\" />
+    <span style=\"font-size:11px; color:#666;\">ticks</span>
   </div>
   <div class=\"container\">
     <div id=\"chart\"></div>
@@ -860,9 +927,37 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
   <script>
     const figures = {fig_json};
     const allRawTs = {all_raw_ts_json};
+    const allPriceData = {all_price_data_json};
     const select = document.getElementById('logSelect');
     const chart = document.getElementById('chart');
     let currentLogKey = null;
+    let applyingPriceDepth = false;
+
+    function getPriceYAxisKey(sortedIndex) {{
+        return sortedIndex === 0 ? 'yaxis' : `yaxis${{2 * sortedIndex + 1}}`;
+    }}
+
+    // depth=null → restore each product's natural (data-fitted) range for this log
+    function applyPriceDepth(depth, logKey) {{
+        const pd = allPriceData[logKey] || {{}};
+        const products = Object.keys(pd).sort();
+        if (!products.length) return;
+        const update = {{}};
+        products.forEach((product, i) => {{
+            const info = pd[product];
+            const half = (depth !== null ? depth : info.depth) / 2;
+            const key = getPriceYAxisKey(i);
+            update[`${{key}}.range`] = [info.center - half, info.center + half];
+            update[`${{key}}.autorange`] = false;
+        }});
+        applyingPriceDepth = true;
+        Plotly.relayout(chart, update);
+    }}
+
+    document.getElementById('priceDepthInput').addEventListener('change', function() {{
+        const depth = parseFloat(this.value);
+        if (depth > 0 && currentLogKey) applyPriceDepth(depth, currentLogKey);
+    }});
 
     function computeStats(rawTs, tMin, tMax) {{
         const ts = rawTs.timeseries || {{}};
@@ -947,6 +1042,12 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
         currentLogKey = logKey;
         const fig = figures[logKey];
         Plotly.react(chart, fig.data, fig.layout, {{responsive: true}});
+        // Restore natural per-product depth; update widget to reflect max natural depth for this log
+        const pd = allPriceData[logKey] || {{}};
+        const depths = Object.values(pd).map(v => v.depth || 100);
+        const naturalMax = depths.length ? Math.round(Math.max(...depths) / 10) * 10 : 100;
+        document.getElementById('priceDepthInput').value = naturalMax;
+        applyPriceDepth(null, logKey);
         const rawTs = allRawTs[logKey] || {{ timeseries: {{}}, trades: {{}} }};
         const [fMin, fMax] = getFullRange(rawTs);
         renderSidebar(rawTs, fMin, fMax, true);
@@ -954,6 +1055,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
 
     chart.on('plotly_relayout', function(eventData) {{
         if (!currentLogKey) return;
+        if (applyingPriceDepth) {{ applyingPriceDepth = false; return; }}
         const rawTs = allRawTs[currentLogKey] || {{ timeseries: {{}}, trades: {{}} }};
 
         let tMin = null, tMax = null;
@@ -979,7 +1081,7 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
 </html>
 """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html)
+    output_path.write_text(html, encoding="utf-8")
 
 
 def safe_file_name(log_key: str) -> str:
@@ -1006,7 +1108,7 @@ def main() -> None:
             raise KeyError(f"Unknown log '{args.log}'. Available: {available}")
 
         data = load_log(logs[args.log])
-        fig, statesheet = build_chart(data, args.log)
+        fig, statesheet, price_data = build_chart(data, args.log)
         summary = build_volume_summary(data)
         raw_ts = build_raw_timeseries(data)
 
@@ -1015,7 +1117,7 @@ def main() -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
 
         # Build custom HTML with sidebar
-        build_single_log_html(fig, statesheet, summary, raw_ts, args.log, output)
+        build_single_log_html(fig, statesheet, summary, raw_ts, price_data, args.log, output)
         print(f"Saved single-log visualization: {output}")
 
         if not args.no_open:
@@ -1026,16 +1128,18 @@ def main() -> None:
     summaries: dict[str, list[dict]] = {}
     statesheets: dict[str, dict] = {}
     all_raw_ts: dict[str, dict] = {}
+    all_price_data: dict[str, dict] = {}
     for log_key, path in logs.items():
         data = load_log(path)
-        fig, statesheet = build_chart(data, log_key)
+        fig, statesheet, price_data = build_chart(data, log_key)
         figures[log_key] = fig.to_plotly_json()
         summaries[log_key] = build_volume_summary(data)
         statesheets[log_key] = statesheet
         all_raw_ts[log_key] = build_raw_timeseries(data)
+        all_price_data[log_key] = price_data
 
     output = Path(args.output) if args.output else VIZ_DIR / "viz_dashboard.html"
-    build_dashboard_html(figures, summaries, statesheets, all_raw_ts, output)
+    build_dashboard_html(figures, summaries, statesheets, all_raw_ts, all_price_data, output)
     print(f"Saved dashboard: {output}")
     if not args.no_open:
         webbrowser.open(output.resolve().as_uri())

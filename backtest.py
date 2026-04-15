@@ -1,22 +1,30 @@
 """
 Local backtester for IMC Prosperity trading strategies.
 
-Adapted from the jmerle/imc-prosperity-3-backtester project for Prosperity 4.
-Replays tutorial round CSV data through any algo file's Trader.run(), simulating
-order matching against the historical order book and market trades.
+Matching model mirrors the Rust backtester (prosperity_rust_backtester):
+  Phase 1 – Aggressive fill: orders that cross the current book fill immediately
+             at the book price.
+  Phase 2 – Market trade fill: remaining unfilled volume is matched against
+             historical market trades.  Queue position is modelled: the existing
+             book volume at each price level is consumed ahead of our order
+             before we can fill there.
 
-Matching model:
-  - Aggressive fills: orders that cross the current book fill immediately
-  - Market trade fills: remaining order volume matched against historical market
-    trades at prices favorable to the trader's quote
+Additional parameters (mirroring Rust CLI flags):
+  --queue-penetration  fraction of each market-trade's volume that is
+                       reachable (default 1.0 = full volume)
+  --slippage-bps       basis-point price adjustment applied to every fill
+                       (default 0.0 = no slippage)
 
 Usage:
-  python3 backtest.py                          # Run trading.py on all available days
-  python3 backtest.py --algo my_strat.py       # Run a different algo file
-  python3 backtest.py --day -1                 # Run day -1 only
-  python3 backtest.py --match-trades worse     # Stricter trade matching
-  python3 backtest.py --print                  # Print trader stdout
-  python3 backtest.py --no-out                 # Skip saving output log
+  python backtest.py                          # Run trading.py on all available days
+  python backtest.py --algo my_strat.py       # Run a different algo file
+  python backtest.py --day -1                 # Run day -1 only
+  python backtest.py --match-trades worse     # Stricter trade matching
+  python backtest.py --queue-penetration 0.5  # Only 50% of market-trade volume reachable
+  python backtest.py --slippage-bps 1         # 1 bps fill-price slippage
+  python backtest.py --print                  # Print trader stdout
+  python backtest.py --no-out                 # Skip saving output log
+  python backtest.py --data prosperity_rust_backtester-main/datasets --round 1
 """
 
 import argparse
@@ -44,7 +52,30 @@ from datamodel import (
     TradingState,
 )
 
-DEFAULT_POSITION_LIMIT = 80
+# ── Position limits (mirrors Rust backtester's hardcoded table) ───────────────
+
+KNOWN_POSITION_LIMITS: Dict[str, int] = {
+    "EMERALDS": 80,
+    "TOMATOES": 80,
+    "INTARIAN_PEPPER_ROOT": 80,
+    "ASH_COATED_OSMIUM": 80,
+    "RAINFOREST_RESIN": 50,
+    "KELP": 50,
+    "SQUID_INK": 50,
+    "CROISSANTS": 250,
+    "JAMS": 350,
+    "DJEMBES": 60,
+    "PICNIC_BASKET1": 60,
+    "PICNIC_BASKET2": 100,
+    "VOLCANIC_ROCK": 400,
+    "VOLCANIC_ROCK_VOUCHER_9500": 200,
+    "VOLCANIC_ROCK_VOUCHER_9750": 200,
+    "VOLCANIC_ROCK_VOUCHER_10000": 200,
+    "VOLCANIC_ROCK_VOUCHER_10250": 200,
+    "VOLCANIC_ROCK_VOUCHER_10500": 200,
+    "MAGNIFICENT_MACARONS": 75,
+}
+DEFAULT_POSITION_LIMIT = 100
 
 
 # ── Algo Loading ──────────────────────────────────────────────────────────────
@@ -53,6 +84,8 @@ def load_algo(algo_path: Path):
     """Dynamically load a trading algo module from a .py file.
 
     Returns (Trader class, position_limits dict, default_limit int).
+    Limits from the algo override the known-limits table; unknown products
+    fall back to the known table, then to DEFAULT_POSITION_LIMIT.
     """
     spec = importlib.util.spec_from_file_location("algo", algo_path)
     mod = importlib.util.module_from_spec(spec)
@@ -63,18 +96,23 @@ def load_algo(algo_path: Path):
 
     default_limit = getattr(mod, "DEFAULT_LIMIT", DEFAULT_POSITION_LIMIT)
 
-    # Support both legacy POSITION_LIMITS dict and the new PRODUCT_CONFIG dict.
+    # Collect explicit limits from the algo (POSITION_LIMITS or PRODUCT_CONFIG).
+    algo_limits: Dict[str, int] = {}
     if hasattr(mod, "POSITION_LIMITS"):
-        position_limits = mod.POSITION_LIMITS
+        algo_limits = mod.POSITION_LIMITS
     elif hasattr(mod, "PRODUCT_CONFIG"):
-        position_limits = {
+        algo_limits = {
             product: cfg.get("limit", default_limit)
             for product, cfg in mod.PRODUCT_CONFIG.items()
         }
-    else:
-        position_limits = {}
 
-    return mod.Trader, position_limits, default_limit
+    # Merge: algo limits win; fall through to known table for everything else.
+    def limit_for(product: str) -> int:
+        if product in algo_limits:
+            return algo_limits[product]
+        return KNOWN_POSITION_LIMITS.get(product, default_limit)
+
+    return mod.Trader, limit_for, default_limit
 
 
 # ── Data Models ───────────────────────────────────────────────────────────────
@@ -86,10 +124,21 @@ class TradeMatchingMode(str, Enum):
 
 
 @dataclass
-class MarketTrade:
+class MatchingConfig:
+    mode: TradeMatchingMode = TradeMatchingMode.all
+    # Fraction of each market trade's volume available to us (0–1).
+    # Mirrors --queue-penetration in the Rust backtester.
+    queue_penetration: float = 1.0
+    # Basis-point slippage applied to every fill price.
+    # Mirrors --price-slippage-bps in the Rust backtester.
+    slippage_bps: float = 0.0
+
+
+@dataclass
+class _MutableMarketTrade:
+    """Wrapper that tracks remaining fillable quantity of a market trade."""
     trade: Trade
-    buy_quantity: int
-    sell_quantity: int
+    quantity: int  # decremented as we consume it
 
 
 @dataclass
@@ -187,7 +236,7 @@ class TradeRow:
             "buyer": self.trade.buyer,
             "seller": self.trade.seller,
             "symbol": self.trade.symbol,
-            "currency": "SEASHELLS",
+            "currency": "XIRECS",
             "price": self.trade.price,
             "quantity": self.trade.quantity,
         }
@@ -200,7 +249,7 @@ class TradeRow:
             f'    "buyer": "{t.buyer}",\n'
             f'    "seller": "{t.seller}",\n'
             f'    "symbol": "{t.symbol}",\n'
-            f'    "currency": "SEASHELLS",\n'
+            f'    "currency": "XIRECS",\n'
             f'    "price": {t.price},\n'
             f'    "quantity": {t.quantity}\n'
             f'  }}'
@@ -221,12 +270,11 @@ class BacktestResult:
 def find_data_file(
     data_dir: Path, round_num: int, day_num: int, prefix: str
 ) -> Optional[Path]:
-    """Try flat layout first, then common subdirectory name conventions."""
+    """Try flat layout, then common subdirectory name conventions."""
     filename = f"{prefix}_round_{round_num}_day_{day_num}.csv"
     flat = data_dir / filename
     if flat.is_file():
         return flat
-    # Check both lowercase and uppercase subdirectory conventions
     for subdir_name in (f"round{round_num}", f"ROUND{round_num}"):
         nested = data_dir / subdir_name / filename
         if nested.is_file():
@@ -249,18 +297,15 @@ def has_day_data(data_dir: Path, round_num: int, day_num: int) -> bool:
 
 
 def detect_days(data_dir: Path, round_num: int) -> List[int]:
-    """Scan data directory for available day numbers."""
     pattern = re.compile(rf"prices_round_{round_num}_day_(-?\d+)\.csv")
     days = []
 
-    # Scan flat layout
     if data_dir.is_dir():
         for f in data_dir.iterdir():
             m = pattern.match(f.name)
             if m:
                 days.append(int(m.group(1)))
 
-    # Scan nested layout (both lowercase and uppercase conventions)
     for subdir_name in (f"round{round_num}", f"ROUND{round_num}"):
         nested = data_dir / subdir_name
         if nested.is_dir():
@@ -274,9 +319,7 @@ def detect_days(data_dir: Path, round_num: int) -> List[int]:
     return sorted(days)
 
 
-def read_day_data(
-    data_dir: Path, round_num: int, day_num: int
-) -> BacktestData:
+def read_day_data(data_dir: Path, round_num: int, day_num: int) -> BacktestData:
     prices_path = find_data_file(data_dir, round_num, day_num, "prices")
     if prices_path is None:
         raise ValueError(
@@ -316,7 +359,6 @@ def read_day_data(
                 )
             )
 
-    # Build indexed structures
     prices_by_ts: Dict[int, Dict[Symbol, PriceRow]] = defaultdict(dict)
     for row in prices:
         prices_by_ts[row.timestamp][row.product] = row
@@ -340,7 +382,7 @@ def read_day_data(
     )
 
 
-# ── Runner / Matching Engine ─────────────────────────────────────────────────
+# ── Runner / Matching Engine ──────────────────────────────────────────────────
 
 def prepare_state(state: TradingState, data: BacktestData) -> None:
     for product in data.products:
@@ -354,7 +396,7 @@ def prepare_state(state: TradingState, data: BacktestData) -> None:
             order_depth.sell_orders[price] = -volume
 
         state.order_depths[product] = order_depth
-        state.listings[product] = Listing(product, product, "SEASHELLS")
+        state.listings[product] = Listing(product, product, "XIRECS")
 
     state.observations = Observation({}, {})
 
@@ -387,12 +429,10 @@ def create_activity_logs(
 ) -> None:
     for product in data.products:
         row = data.prices[state.timestamp][product]
-
-        product_profit_loss = data.profit_loss[product]
-
+        pnl = data.profit_loss[product]
         position = state.position.get(product, 0)
         if position != 0:
-            product_profit_loss += position * row.mid_price
+            pnl += position * row.mid_price
 
         bp_len = len(row.bid_prices)
         bv_len = len(row.bid_volumes)
@@ -416,9 +456,8 @@ def create_activity_logs(
             row.ask_prices[2] if ap_len > 2 else "",
             row.ask_volumes[2] if av_len > 2 else "",
             row.mid_price,
-            product_profit_loss,
+            pnl,
         ]
-
         result.activity_logs.append(ActivityLogRow(columns))
 
 
@@ -427,14 +466,14 @@ def enforce_limits(
     data: BacktestData,
     orders: Dict[Symbol, List[Order]],
     sandbox_row: SandboxLogRow,
-    limits: Dict[str, int],
+    limit_for,
     default_limit: int,
 ) -> None:
     sandbox_log_lines = []
     for product in data.products:
         product_orders = orders.get(product, [])
         product_position = state.position.get(product, 0)
-        limit = limits.get(product, default_limit)
+        limit = limit_for(product)
 
         total_long = sum(o.quantity for o in product_orders if o.quantity > 0)
         total_short = sum(abs(o.quantity) for o in product_orders if o.quantity < 0)
@@ -452,162 +491,58 @@ def enforce_limits(
         sandbox_row.sandbox_log += "\n" + "\n".join(sandbox_log_lines)
 
 
-def match_buy_order(
-    state: TradingState,
-    data: BacktestData,
-    order: Order,
-    market_trades: List[MarketTrade],
-    trade_matching_mode: TradeMatchingMode,
-) -> List[Trade]:
-    trades = []
+# ── Core matching helpers (mirrors Rust runner.rs) ───────────────────────────
 
-    order_depth = state.order_depths[order.symbol]
-    price_matches = sorted(
-        price for price in order_depth.sell_orders.keys() if price <= order.price
-    )
-
-    for price in price_matches:
-        volume = min(order.quantity, abs(order_depth.sell_orders[price]))
-
-        trades.append(
-            Trade(order.symbol, price, volume, "SUBMISSION", "", state.timestamp)
-        )
-
-        state.position[order.symbol] = state.position.get(order.symbol, 0) + volume
-        data.profit_loss[order.symbol] -= price * volume
-
-        order_depth.sell_orders[price] += volume
-        if order_depth.sell_orders[price] == 0:
-            order_depth.sell_orders.pop(price)
-
-        order.quantity -= volume
-        if order.quantity == 0:
-            return trades
-
-    if trade_matching_mode == TradeMatchingMode.none:
-        return trades
-
-    for market_trade in market_trades:
-        if (
-            market_trade.sell_quantity == 0
-            or market_trade.trade.price > order.price
-            or (
-                market_trade.trade.price == order.price
-                and trade_matching_mode == TradeMatchingMode.worse
-            )
-        ):
-            continue
-
-        volume = min(order.quantity, market_trade.sell_quantity)
-
-        trades.append(
-            Trade(
-                order.symbol,
-                order.price,
-                volume,
-                "SUBMISSION",
-                market_trade.trade.seller,
-                state.timestamp,
-            )
-        )
-
-        state.position[order.symbol] = state.position.get(order.symbol, 0) + volume
-        data.profit_loss[order.symbol] -= order.price * volume
-
-        market_trade.sell_quantity -= volume
-
-        order.quantity -= volume
-        if order.quantity == 0:
-            return trades
-
-    return trades
+def _slippage_price(price: int, is_buy: bool, bps: float) -> int:
+    """Apply basis-point slippage to a fill price."""
+    if bps <= 0.0:
+        return price
+    factor = 1.0 + bps / 10_000.0
+    adjusted = price * factor if is_buy else price / factor
+    return round(adjusted)
 
 
-def match_sell_order(
-    state: TradingState,
-    data: BacktestData,
-    order: Order,
-    market_trades: List[MarketTrade],
-    trade_matching_mode: TradeMatchingMode,
-) -> List[Trade]:
-    trades = []
-
-    order_depth = state.order_depths[order.symbol]
-    price_matches = sorted(
-        (price for price in order_depth.buy_orders.keys() if price >= order.price),
-        reverse=True,
-    )
-
-    for price in price_matches:
-        volume = min(abs(order.quantity), order_depth.buy_orders[price])
-
-        trades.append(
-            Trade(order.symbol, price, volume, "", "SUBMISSION", state.timestamp)
-        )
-
-        state.position[order.symbol] = state.position.get(order.symbol, 0) - volume
-        data.profit_loss[order.symbol] += price * volume
-
-        order_depth.buy_orders[price] -= volume
-        if order_depth.buy_orders[price] == 0:
-            order_depth.buy_orders.pop(price)
-
-        order.quantity += volume
-        if order.quantity == 0:
-            return trades
-
-    if trade_matching_mode == TradeMatchingMode.none:
-        return trades
-
-    for market_trade in market_trades:
-        if (
-            market_trade.buy_quantity == 0
-            or market_trade.trade.price < order.price
-            or (
-                market_trade.trade.price == order.price
-                and trade_matching_mode == TradeMatchingMode.worse
-            )
-        ):
-            continue
-
-        volume = min(abs(order.quantity), market_trade.buy_quantity)
-
-        trades.append(
-            Trade(
-                order.symbol,
-                order.price,
-                volume,
-                market_trade.trade.buyer,
-                "SUBMISSION",
-                state.timestamp,
-            )
-        )
-
-        state.position[order.symbol] = state.position.get(order.symbol, 0) - volume
-        data.profit_loss[order.symbol] += order.price * volume
-
-        market_trade.buy_quantity -= volume
-
-        order.quantity += volume
-        if order.quantity == 0:
-            return trades
-
-    return trades
+def _queue_penetration_available(quantity: int, penetration: float) -> int:
+    """Scale a market trade's volume by queue_penetration, ensuring at least 1
+    when penetration > 0 and quantity > 0 (mirrors Rust queue_penetration_available)."""
+    if penetration <= 0.0:
+        return 0
+    raw = quantity * penetration
+    available = round(raw)
+    if quantity > 0 and penetration > 0.0 and available == 0:
+        available = 1
+    return max(0, available)
 
 
-def match_order(
-    state: TradingState,
-    data: BacktestData,
-    order: Order,
-    market_trades: List[MarketTrade],
-    trade_matching_mode: TradeMatchingMode,
-) -> List[Trade]:
-    if order.quantity > 0:
-        return match_buy_order(state, data, order, market_trades, trade_matching_mode)
-    elif order.quantity < 0:
-        return match_sell_order(state, data, order, market_trades, trade_matching_mode)
-    else:
-        return []
+def _market_trade_duplicates_touch(
+    trade: Trade,
+    best_bid: Optional[int],
+    best_ask: Optional[int],
+) -> bool:
+    """Return True if this historical trade would be double-counted by the
+    book-crossing phase.  Mirrors Rust market_trade_duplicates_touch."""
+    if trade.buyer == "SUBMISSION" and best_ask is not None and trade.price >= best_ask:
+        return True
+    if trade.seller == "SUBMISSION" and best_bid is not None and trade.price <= best_bid:
+        return True
+    return False
+
+
+def _eligible_trade_price(
+    order_price: int,
+    trade_price: int,
+    quantity: int,
+    mode: TradeMatchingMode,
+) -> bool:
+    """Return True if this market trade is eligible to fill our order.
+    Mirrors Rust eligible_trade_price."""
+    if mode == TradeMatchingMode.none:
+        return False
+    if quantity > 0:
+        return trade_price <= order_price if mode == TradeMatchingMode.all else trade_price < order_price
+    if quantity < 0:
+        return trade_price >= order_price if mode == TradeMatchingMode.all else trade_price > order_price
+    return False
 
 
 def match_orders(
@@ -615,38 +550,167 @@ def match_orders(
     data: BacktestData,
     orders: Dict[Symbol, List[Order]],
     result: BacktestResult,
-    trade_matching_mode: TradeMatchingMode,
+    config: MatchingConfig,
 ) -> None:
-    market_trades = {
-        product: [MarketTrade(t, t.quantity, t.quantity) for t in trades]
-        for product, trades in data.trades[state.timestamp].items()
-    }
+    """
+    Two-phase matching engine mirroring the Rust backtester.
 
+    Phase 1 – Book crossing: fills immediately at the book price for any order
+              that crosses the current order depth.
+    Phase 2 – Market trade matching: remaining unfilled volume is matched
+              against historical market trades.  Queue position is modelled:
+              existing book volume at each price is consumed ahead of our order
+              before we can fill there (buy_queue / sell_queue).
+    """
     for product in data.products:
-        new_trades = []
+        order_depth = state.order_depths[product]
+        product_orders = orders.get(product, [])
 
-        for order in orders.get(product, []):
-            new_trades.extend(
-                match_order(
-                    state,
-                    data,
-                    order,
-                    market_trades.get(product, []),
-                    trade_matching_mode,
-                )
-            )
+        # Best bid/ask for duplicate-touch filter.
+        best_bid = max(order_depth.buy_orders) if order_depth.buy_orders else None
+        best_ask = min(order_depth.sell_orders) if order_depth.sell_orders else None
 
-        if new_trades:
-            state.own_trades[product] = new_trades
-            result.trades.extend([TradeRow(trade) for trade in new_trades])
+        # Queue-ahead volumes: tracks book depth that sits in front of our
+        # passive order at each price level.  Initialized from the current book
+        # and decremented as market trades consume it.
+        buy_queue: Dict[int, int] = dict(order_depth.buy_orders)           # price -> +volume
+        sell_queue: Dict[int, int] = {                                       # price -> +volume
+            p: abs(v) for p, v in order_depth.sell_orders.items()
+        }
 
-    for product, trades in market_trades.items():
-        for trade in trades:
-            trade.trade.quantity = min(trade.buy_quantity, trade.sell_quantity)
+        # Build market-trade availability list (with penetration scaling,
+        # deduplication filter, and mutable quantity tracking).
+        raw_trades = data.trades[state.timestamp].get(product, [])
+        market_available: List[_MutableMarketTrade] = []
+        for t in raw_trades:
+            if _market_trade_duplicates_touch(t, best_bid, best_ask):
+                continue
+            avail = _queue_penetration_available(t.quantity, config.queue_penetration)
+            if avail > 0:
+                market_available.append(_MutableMarketTrade(t, avail))
 
-        remaining = [t.trade for t in trades if t.trade.quantity > 0]
-        state.market_trades[product] = remaining
-        result.trades.extend([TradeRow(trade) for trade in remaining])
+        own_trades: List[Trade] = []
+
+        for order in product_orders:
+            remaining = order.quantity
+
+            # ── Phase 1: aggressive book crossing ────────────────────────────
+            if remaining > 0:
+                # Buy order: sweep ask levels at or below our price.
+                for ask_price in sorted(order_depth.sell_orders):
+                    if remaining <= 0:
+                        break
+                    if ask_price > order.price:
+                        break
+                    vol = order_depth.sell_orders[ask_price]
+                    if vol >= 0:
+                        continue
+                    fill = min(remaining, abs(vol))
+                    trade_price = _slippage_price(ask_price, True, config.slippage_bps)
+                    own_trades.append(Trade(
+                        order.symbol, trade_price, fill,
+                        "SUBMISSION", "", state.timestamp,
+                    ))
+                    state.position[order.symbol] = state.position.get(order.symbol, 0) + fill
+                    data.profit_loss[order.symbol] -= trade_price * fill
+                    order_depth.sell_orders[ask_price] += fill
+                    if order_depth.sell_orders[ask_price] == 0:
+                        del order_depth.sell_orders[ask_price]
+                    remaining -= fill
+
+            elif remaining < 0:
+                # Sell order: sweep bid levels at or above our price.
+                for bid_price in sorted(order_depth.buy_orders, reverse=True):
+                    if remaining >= 0:
+                        break
+                    if bid_price < order.price:
+                        break
+                    vol = order_depth.buy_orders[bid_price]
+                    if vol <= 0:
+                        continue
+                    fill = min(-remaining, vol)
+                    trade_price = _slippage_price(bid_price, False, config.slippage_bps)
+                    own_trades.append(Trade(
+                        order.symbol, trade_price, fill,
+                        "", "SUBMISSION", state.timestamp,
+                    ))
+                    state.position[order.symbol] = state.position.get(order.symbol, 0) - fill
+                    data.profit_loss[order.symbol] += trade_price * fill
+                    order_depth.buy_orders[bid_price] -= fill
+                    if order_depth.buy_orders[bid_price] == 0:
+                        del order_depth.buy_orders[bid_price]
+                    remaining += fill
+
+            # ── Phase 2: market trade matching with queue position model ──────
+            if remaining != 0 and config.mode != TradeMatchingMode.none:
+                for mt in market_available:
+                    if remaining == 0:
+                        break
+                    if mt.quantity <= 0:
+                        continue
+                    if not _eligible_trade_price(
+                        order.price, mt.trade.price, remaining, config.mode
+                    ):
+                        continue
+
+                    # Queue position: consume book volume ahead of us at the
+                    # same price before our order can fill.
+                    if remaining > 0 and mt.trade.price == order.price:
+                        ahead = buy_queue.get(order.price, 0)
+                        consumed = min(mt.quantity, ahead)
+                        mt.quantity -= consumed
+                        new_ahead = ahead - consumed
+                        if new_ahead <= 0:
+                            buy_queue.pop(order.price, None)
+                        else:
+                            buy_queue[order.price] = new_ahead
+
+                    elif remaining < 0 and mt.trade.price == order.price:
+                        ahead = sell_queue.get(order.price, 0)
+                        consumed = min(mt.quantity, ahead)
+                        mt.quantity -= consumed
+                        new_ahead = ahead - consumed
+                        if new_ahead <= 0:
+                            sell_queue.pop(order.price, None)
+                        else:
+                            sell_queue[order.price] = new_ahead
+
+                    if mt.quantity <= 0:
+                        continue
+
+                    fill = min(abs(remaining), mt.quantity)
+                    execution_price = _slippage_price(
+                        order.price, remaining > 0, config.slippage_bps
+                    )
+
+                    if remaining > 0:
+                        own_trades.append(Trade(
+                            order.symbol, execution_price, fill,
+                            "SUBMISSION", mt.trade.seller, state.timestamp,
+                        ))
+                        state.position[order.symbol] = state.position.get(order.symbol, 0) + fill
+                        data.profit_loss[order.symbol] -= execution_price * fill
+                        remaining -= fill
+                    else:
+                        own_trades.append(Trade(
+                            order.symbol, execution_price, fill,
+                            mt.trade.buyer, "SUBMISSION", state.timestamp,
+                        ))
+                        state.position[order.symbol] = state.position.get(order.symbol, 0) - fill
+                        data.profit_loss[order.symbol] += execution_price * fill
+                        remaining += fill
+
+                    mt.quantity -= fill
+
+        # Commit own trades to state and result.
+        if own_trades:
+            state.own_trades[product] = own_trades
+            result.trades.extend(TradeRow(t) for t in own_trades)
+
+        # Remaining market trades flow into state.market_trades.
+        remaining_market = [mt.trade for mt in market_available if mt.quantity > 0]
+        state.market_trades[product] = remaining_market
+        result.trades.extend(TradeRow(t) for t in remaining_market)
 
 
 # ── Main Backtest Loop ────────────────────────────────────────────────────────
@@ -656,10 +720,10 @@ def run_backtest(
     data_dir: Path,
     round_num: int,
     day_num: int,
-    limits: Dict[str, int],
+    limit_for,
     default_limit: int,
     print_output: bool,
-    trade_matching_mode: TradeMatchingMode,
+    config: MatchingConfig,
 ) -> BacktestResult:
     data = read_day_data(data_dir, round_num, day_num)
 
@@ -686,13 +750,14 @@ def run_backtest(
     for i, timestamp in enumerate(timestamps):
         state.timestamp = timestamp
         state.traderData = trader_data
+        state.own_trades = {}
+        state.market_trades = {}
 
         prepare_state(state, data)
 
         stdout = StringIO()
 
         if print_output:
-            # No Tee — just capture and print after
             with redirect_stdout(stdout):
                 orders, conversions, trader_data = trader.run(state)
             captured = stdout.getvalue()
@@ -711,10 +776,9 @@ def run_backtest(
 
         type_check_orders(orders)
         create_activity_logs(state, data, result)
-        enforce_limits(state, data, orders, sandbox_row, limits, default_limit)
-        match_orders(state, data, orders, result, trade_matching_mode)
+        enforce_limits(state, data, orders, sandbox_row, limit_for, default_limit)
+        match_orders(state, data, orders, result, config)
 
-        # Progress indicator
         if (i + 1) % 500 == 0 or (i + 1) == total:
             print(
                 f"\r  Progress: {i + 1}/{total} timestamps "
@@ -723,14 +787,13 @@ def run_backtest(
                 flush=True,
             )
 
-    print()  # newline after progress
+    print()
     return result
 
 
 # ── Output Generation ─────────────────────────────────────────────────────────
 
 def write_log_output(output_file: Path, merged: BacktestResult) -> None:
-    """Write P3-style .log file (Sandbox logs / Activities log / Trade History)."""
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with output_file.open("w+", encoding="utf-8") as f:
         f.write("Sandbox logs:\n")
@@ -753,10 +816,8 @@ def write_log_output(output_file: Path, merged: BacktestResult) -> None:
 
 
 def write_json_output(output_file: Path, merged: BacktestResult) -> None:
-    """Write JSON matching IMC server log format (for visualize_log.py)."""
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Build activitiesLog CSV string
     header = (
         "day;timestamp;product;bid_price_1;bid_volume_1;bid_price_2;"
         "bid_volume_2;bid_price_3;bid_volume_3;ask_price_1;ask_volume_1;"
@@ -765,34 +826,28 @@ def write_json_output(output_file: Path, merged: BacktestResult) -> None:
     )
     activities_csv = header + "\n" + "\n".join(map(str, merged.activity_logs))
 
-    # Build graphLog: total PnL per timestamp
     pnl_by_ts: Dict[int, float] = defaultdict(float)
     for row in merged.activity_logs:
         pnl_by_ts[row.timestamp] += row.columns[-1]
 
     graph_lines = ["timestamp;value"]
-    for ts in sorted(pnl_by_ts.keys()):
+    for ts in sorted(pnl_by_ts):
         graph_lines.append(f"{ts};{pnl_by_ts[ts]}")
     graph_log = "\n".join(graph_lines)
 
-    # Final positions
     positions_by_product: Dict[str, int] = {}
-    if merged.activity_logs:
-        last_ts = merged.activity_logs[-1].timestamp
-        # Compute from trades
-        for tr in merged.trades:
-            t = tr.trade
-            if t.buyer == "SUBMISSION":
-                positions_by_product[t.symbol] = positions_by_product.get(t.symbol, 0) + t.quantity
-            elif t.seller == "SUBMISSION":
-                positions_by_product[t.symbol] = positions_by_product.get(t.symbol, 0) - t.quantity
+    for tr in merged.trades:
+        t = tr.trade
+        if t.buyer == "SUBMISSION":
+            positions_by_product[t.symbol] = positions_by_product.get(t.symbol, 0) + t.quantity
+        elif t.seller == "SUBMISSION":
+            positions_by_product[t.symbol] = positions_by_product.get(t.symbol, 0) - t.quantity
 
     positions = [
         {"symbol": sym, "quantity": qty}
         for sym, qty in sorted(positions_by_product.items())
     ]
 
-    # Total profit
     total_profit = 0.0
     if merged.activity_logs:
         last_ts = merged.activity_logs[-1].timestamp
@@ -801,7 +856,6 @@ def write_json_output(output_file: Path, merged: BacktestResult) -> None:
                 break
             total_profit += row.columns[-1]
 
-    # Trade history (only our trades)
     trade_history = [
         tr.to_dict()
         for tr in merged.trades
@@ -859,10 +913,8 @@ def merge_results(
     else:
         timestamp_offset = 0
 
-    sandbox_logs.extend(
-        [row.with_offset(timestamp_offset) for row in b.sandbox_logs]
-    )
-    trades.extend([row.with_offset(timestamp_offset) for row in b.trades])
+    sandbox_logs.extend(row.with_offset(timestamp_offset) for row in b.sandbox_logs)
+    trades.extend(row.with_offset(timestamp_offset) for row in b.trades)
 
     if merge_profit_loss:
         profit_loss_offsets: Dict[str, float] = defaultdict(float)
@@ -873,14 +925,12 @@ def merge_results(
             profit_loss_offsets[row.columns[2]] = row.columns[-1]
 
         activity_logs.extend(
-            [
-                row.with_offset(timestamp_offset, profit_loss_offsets[row.columns[2]])
-                for row in b.activity_logs
-            ]
+            row.with_offset(timestamp_offset, profit_loss_offsets[row.columns[2]])
+            for row in b.activity_logs
         )
     else:
         activity_logs.extend(
-            [row.with_offset(timestamp_offset, 0) for row in b.activity_logs]
+            row.with_offset(timestamp_offset, 0) for row in b.activity_logs
         )
 
     return BacktestResult(
@@ -903,6 +953,24 @@ def print_overall_summary(results: List[BacktestResult]) -> None:
     print(f"  Total profit: {total_profit:,.0f}")
 
 
+def _resolve_data_dir(raw: str) -> Path:
+    """Resolve the data directory, falling back to the Rust backtester's
+    datasets/ folder when the given path doesn't exist."""
+    p = Path(raw)
+    if p.is_dir():
+        return p
+    # Try relative to this file
+    here = Path(__file__).parent
+    candidate = here / raw
+    if candidate.is_dir():
+        return candidate
+    # Fall back to bundled datasets
+    rust_datasets = here / "prosperity_rust_backtester-main" / "datasets"
+    if rust_datasets.is_dir():
+        return rust_datasets
+    return p  # will fail later with a clear error
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -919,7 +987,11 @@ def main():
         "--data",
         type=str,
         default="ROUND_1",
-        help="Path to data directory (default: ROUND_1)",
+        help=(
+            "Path to data directory (default: ROUND_1). "
+            "Also accepts prosperity_rust_backtester-main/datasets for the "
+            "bundled Rust backtester datasets."
+        ),
     )
     parser.add_argument(
         "--round",
@@ -938,7 +1010,31 @@ def main():
         type=str,
         choices=["all", "worse", "none"],
         default="all",
-        help="How to match orders against market trades (default: all)",
+        help=(
+            "Market trade matching mode (default: all). "
+            "'all' matches at trade_price <= order_price (buy) or >= (sell). "
+            "'worse' requires strictly better price. 'none' disables market matching."
+        ),
+    )
+    parser.add_argument(
+        "--queue-penetration",
+        type=float,
+        default=1.0,
+        dest="queue_penetration",
+        help=(
+            "Fraction of each market trade's volume reachable by our order "
+            "(default: 1.0). Mirrors --queue-penetration in the Rust backtester."
+        ),
+    )
+    parser.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=0.0,
+        dest="slippage_bps",
+        help=(
+            "Basis-point price slippage applied to every fill "
+            "(default: 0.0). Mirrors --price-slippage-bps in the Rust backtester."
+        ),
     )
     parser.add_argument(
         "--merge-pnl",
@@ -965,10 +1061,8 @@ def main():
     args = parser.parse_args()
 
     algo_path = Path(args.algo)
-    # Auto-add .py extension if missing
     if not algo_path.suffix:
         algo_path = algo_path.with_suffix(".py")
-    # Try logs/ prefix if not found
     if not algo_path.exists():
         candidate = Path("logs") / algo_path
         if candidate.exists():
@@ -977,19 +1071,22 @@ def main():
         print(f"Error: algo file not found: {algo_path}")
         sys.exit(1)
 
-    data_dir = Path(args.data)
+    data_dir = _resolve_data_dir(args.data)
     if not data_dir.is_dir():
         print(f"Error: data directory not found: {data_dir}")
         sys.exit(1)
 
     algo_name = algo_path.stem
     print(f"Loading algo: {algo_path}")
-    trader_cls, position_limits, default_limit = load_algo(algo_path)
+    trader_cls, limit_for, default_limit = load_algo(algo_path)
 
     round_num = args.round
-    trade_matching_mode = TradeMatchingMode(args.match_trades)
+    config = MatchingConfig(
+        mode=TradeMatchingMode(args.match_trades),
+        queue_penetration=args.queue_penetration,
+        slippage_bps=args.slippage_bps,
+    )
 
-    # Determine days to run
     if args.day is not None:
         days = [args.day]
         if not has_day_data(data_dir, round_num, args.day):
@@ -1003,8 +1100,9 @@ def main():
 
     print(
         f"Round {round_num} | Days: {days} | "
-        f"Match mode: {trade_matching_mode.value} | "
-        f"Limits: {position_limits or {f'default={default_limit}'}}"
+        f"Match mode: {config.mode.value} | "
+        f"Queue penetration: {config.queue_penetration} | "
+        f"Slippage bps: {config.slippage_bps}"
     )
 
     results = []
@@ -1019,10 +1117,10 @@ def main():
             data_dir,
             round_num,
             day_num,
-            position_limits,
+            limit_for,
             default_limit,
             args.print_output,
-            trade_matching_mode,
+            config,
         )
 
         print_day_summary(result)
@@ -1031,7 +1129,6 @@ def main():
     if len(results) > 1:
         print_overall_summary(results)
 
-    # Write output
     if not args.no_out and results:
         if args.out:
             output_path = Path(args.out)
@@ -1045,7 +1142,6 @@ def main():
         )
         write_json_output(output_path, merged)
 
-        # Also write .log for P3-style visualizer compatibility
         log_path = output_path.with_suffix(".log")
         write_log_output(log_path, merged)
 
