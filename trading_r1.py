@@ -154,13 +154,13 @@ PRODUCT_CONFIG = {
         # Economics: worth paying up to ~13 ticks extra until ts ≈ 87 000.
         # Key finding: position was only reaching ~60 at ts=47700 without this.
         # With this fix, we expect pos=70 by ts≈5000, gaining ~2400 extra PnL.
-        "buy_to_target_position": 70,   # lift ask until we hold this many units
+        "buy_to_target_position": 80,   # lift ask until we hold this many units
         "buy_to_ask_max_offset":  13,   # max ticks above FV we'll chase the ask
 
         # ── Hold phase: protect the long position ────────────────────────
         # Never allow selling below this position.
-        # Raised from 60 → 65 to hold 5 more units on average.
-        "min_long_position": 70,
+        # All-in: hold maximum long position (= limit).
+        "min_long_position": 80,
 
         # no inventory skew needed (trend is monotone)
         "skew_tiers": [(80, 0.0)],
@@ -169,7 +169,7 @@ PRODUCT_CONFIG = {
         # Only activates when pos > asym_moderate_pos (= 70 here), i.e. 5 units
         # above the floor.  This captures the bid-ask spread on the marginal units.
         "asymmetric_quoting":  True,
-        "asym_moderate_pos":   70,      # = min_long + 5
+        "asym_moderate_pos":   80,      # = min_long + 5
         "asym_critical_pos":   78,      # ≈ limit − 2
         "asym_offset":         2,
 
@@ -181,61 +181,39 @@ PRODUCT_CONFIG = {
 
     "ASH_COATED_OSMIUM": {
         "limit": 80,
-
-        # ── Fair-value model ──────────────────────────────────────────────
-        # Structural MM quotes 9993/10009 (mid≈10001, not 10000).  EMA of book
-        # mid tracks this correctly and avoids the fixed-10000 anchor bias.
         "fair_value":  "midwall",
-        "ema_alpha":   0.05,            # slow EMA; ~20-tick half-life
-
-        "use_l2_microprice":     False,  # L2 blows up on compressed spread
+        "ema_alpha":   0.05,
+        "use_l2_microprice":     False,
         "wide_spread_threshold": 10,
-
         "use_factors":    False,
         "factor_fv_skew": 0.0,
 
-        # ── Inventory skew (for taking decisions) ────────────────────────
-        # Shifts the FV used in take_orders so we pay less to add when large.
-        # Like a delta-hedge: the deeper in the book, the wider the required edge.
-        # Restored from run 137265 (proved 11.32 tick round-trip vs 9.58 before).
+        # 1. SOFTEN SKEW TIERS
+        # Push the pure MM zone out to 50. Let it build inventory naturally.
         "skew_tiers": [
-            (30, 0.0),   # |pos| <  30 → no skew (pure MM zone)
-            (55, 0.08),  # |pos| <  55 → light skew
-            (80, 0.25),  # |pos| ≥  55 → aggressive skew
+            # (60, 0.0),   # |pos| < 50 → no skew, capture full spread
+            # (70, 0.05),  # |pos| < 65 → light skew (starts applying brakes)
+            (80, 0.0),  # |pos| ≥ 65 → aggressive skew
         ],
 
-        # ── Asymmetric quoting ────────────────────────────────────────────
-        # BUG FIX (vs 136519): fv_spread was overriding this block.  Now that
-        # fv_spread is removed, this logic actually runs.
-        #
-        # Restored to run 137265 config (asym_moderate=30, asym_critical=55).
-        # Attempted lowering asym_moderate to 20 in run 137977 — cost −78 PnL:
-        # at pos=[+20,+30) (14.8% of time), asks shifted from best_ask−1≈10008
-        # to FV+2≈10002, giving up 6 ticks/fill with no short-side benefit
-        # (ASH only reached −13 short in this seed; the −20 threshold never fired).
-        # Lesson: the pure-MM zone earns more than premature asymmetric quoting.
-        "asymmetric_quoting":  True,
-        "asym_moderate_pos":   30,      # tilt only at ±30+; preserves full MM spread below
-        "asym_critical_pos":   55,      # emergency unwind at ±55 units
-        "asym_offset":         2,       # ticks from FV for moderate quote
+        # 2. DELAY ASYMMETRIC QUOTING
+        # 1. DISABLE ASYMMETRIC QUOTING
+        # Set this to False. Keep your quotes wide and passive until the very end.
+        "asymmetric_quoting":  False,
+        "asym_moderate_pos":   80,
+        "asym_critical_pos":   80,
+        "asym_offset":         2,
 
-        # quote_offset=-1: our passive bid/ask sit 1 tick inside the structural
-        # MM spread (9993/10009), making us the best price in the book.
         "quote_offset": -1,
 
-        # ── Inventory-aware lot sizing ────────────────────────────────────
-        # When we're unbalanced, post more on the side we want filled.
-        # Like increasing a hedge ratio when a position grows: heavier on the
-        # side that reduces exposure, lighter on the side that adds to it.
-        # Threshold raised 12 → 20 (from 137265) to avoid over-sizing noise.
-        "max_passive_qty":          8,  # lots per side when balanced
-        "size_imbalance_threshold": 20,  # switch to asymmetric sizing above this
-        "size_heavy_qty":          14,  # lots on depleted (want-to-fill) side
-        "size_light_qty":           4,  # lots on over-full side
+        # 2. DISABLE ASYMMETRIC SIZING & UNCAPP VOLUME
+        # Let the bot post its ENTIRE remaining capacity (up to 80) on the book.
+        "max_passive_qty":          None,  # <-- Changed from 8 to None
+        "size_imbalance_threshold": 80,   # <-- Pushed to the limit
+        "size_heavy_qty":          12,
+        "size_light_qty":           4,
 
-        "spread_aware_taking": False,   # mean reversion → always take cross-FV
-
-        # Pepper-style buy-to-target not needed for ASH (no trend).
+        "spread_aware_taking": False,
         "buy_to_target_position": None,
         "buy_to_ask_max_offset":  None,
     },
