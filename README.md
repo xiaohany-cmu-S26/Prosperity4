@@ -109,10 +109,12 @@ python3 visualize_log.py --log 3179/3179
 ```
 
 Features:
-- Order book depth, spread, and price charts
+- Order book depth, spread, and price charts per product
+- Price y-axis auto-scaled to the data: centered on the median, depth set from the P1–P99 price range (outlier spikes are ignored)
+- **Price depth** input in the toolbar — type a tick count to zoom the price axis in or out uniformly across all product charts
 - PnL with inventory overlay (secondary y-axis)
 - Total PnL trace across products
-- Dynamic sidebar metrics that update on zoom/pan
+- Dynamic sidebar metrics (PnL, positions, trade counts) that update as you zoom/pan the x-axis
 
 ## Configuration
 
