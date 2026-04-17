@@ -70,43 +70,28 @@ PRODUCT_CONFIG = {
         "use_l2_microprice":     False,
         "wide_spread_threshold": 10,
 
-        # Tiered inventory skew: shifts fair value used for taking/making.
-        # Pure MM zone extends to ±30; light skew from 30–55; hard unwind beyond 55.
-        "skew_tiers": [
-            (30, 0.0),   # |pos| < 30 → no skew, symmetric MM
-            (55, 0.05),  # |pos| < 55 → light skew (~2.75 tick shift at pos=55)
-            (80, 0.15),  # |pos| ≥ 55 → aggressive inventory clear
-        ],
+        # No FV skew and no asymmetric quoting.
+        # Insight: the position-limit capacity constraint handles inventory
+        # naturally — as we go long, buy_capacity shrinks and sell_capacity grows,
+        # posting fewer bids and more asks automatically.
+        # Adding skew or asymmetric quoting reduces per-fill edge without a
+        # commensurate volume benefit on this strongly mean-reverting product.
+        "skew_tiers": [(80, 0.0)],
+        "asymmetric_quoting": False,
 
-        # Asymmetric quoting: when inventory builds, tighten the unwinding side.
-        # At moderate (30–55): unwind side moves to FV ± asym_offset (= ±2).
-        # At critical (> 55): unwind side moves to FV ± 1 (near-market).
-        "asymmetric_quoting": True,
-        "asym_moderate_pos":  30,
-        "asym_critical_pos":  55,
-        "asym_offset":        2,
+        # Single-tier passive quoting: full capacity at best_bid+1 / best_ask-1.
+        # This places us as the unique best bid/ask, ahead of the structural MM
+        # (~9992/10008), capturing every incoming market order (~7 tick edge vs FV).
+        # Adding layers at n=0 or n≥2 strictly hurts: any order at a better price
+        # for the counterparty fills before n=1, reducing per-fill edge, and those
+        # lots cannot also be used at n=1 since total capacity is fixed.
+        "quote_offset":    -1,    # best_bid+1 / best_ask-1
+        "max_passive_qty": None,  # post full remaining capacity
 
-        # Primary quote: 1 tick inside the book (no queue competition).
-        "quote_offset":    -1,
-        "max_passive_qty": None,
-
-        # Secondary quote: also post at the current best bid/ask (at_book_qty lots).
-        # Rationale: structural MMs rest here; once their queue is exhausted our
-        # at-book order captures the next incoming trade at that price level.
-        "also_quote_at_book": True,
-        "at_book_qty":        5,
-
-        # Deeper quote: 2 ticks inside the book (bid+2 / ask-2), small volume.
-        # Fills when the spread compresses or a large sweep clears the ±1 level.
-        # Volume is intentionally ~1/3–1/2 of the ±1 primary order.
-        "also_quote_deeper": True,
-        "deeper_qty":        6,   # ≈ 14 * 0.4 (between 1/3 and 1/2 of size_heavy_qty)
-
-        # Inventory-aware sizing (activates when |pos| ≥ size_imbalance_threshold).
-        # Heavy side = depleted (need to rebuild); light side = full (avoid adding).
-        "size_imbalance_threshold": 30,
-        "size_heavy_qty":           14,
-        "size_light_qty":            4,
+        # Size override disabled — capacity constraint is sufficient inventory mgmt.
+        "size_imbalance_threshold": 80,
+        "size_heavy_qty": 14,
+        "size_light_qty":  4,
 
         "spread_aware_taking":    False,
         "buy_to_target_position": None,
@@ -322,15 +307,67 @@ class Trader:
         if best_bid is None or best_ask is None:
             return orders
 
-        quote_offset = cfg.get("quote_offset", 0)
+        # Max sell constrained by min_long floor.
+        max_sell_passive = (
+            max(0, position - min_long) if min_long > 0 else sell_capacity
+        )
+        effective_sell_cap = min(sell_capacity, max_sell_passive)
+        remaining_buy  = buy_capacity
+        remaining_sell = effective_sell_cap
 
-        # Primary quote prices (1 tick inside by default).
+        # ── Multi-layer book-anchored quoting ────────────────────────────
+        # bid at best_bid+n / ask at best_ask-n for each (n, qty) in quote_layers.
+        # Quotes are book-anchored so they track the live book with no EMA lag.
+        # skewed_fv acts as a sanity filter: we only post bids below our FV
+        # estimate and asks above it, ensuring positive edge on every fill.
+        # With skew_factor=0, skewed_fv = base_fv and the filter rarely binds
+        # for a product with a wide, stable spread like ACO.
+        if cfg.get("quote_layers") is not None:
+            imb_thresh  = cfg.get("size_imbalance_threshold")
+            heavy_scale = cfg.get("heavy_scale", 1.0)
+            light_scale = cfg.get("light_scale", 1.0)
+            abs_pos     = abs(position)
+            imbalanced  = imb_thresh is not None and abs_pos >= imb_thresh
+
+            for n, base_qty in cfg["quote_layers"]:
+                bid_price = best_bid + n
+                ask_price = best_ask - n
+
+                if imbalanced:
+                    if position < 0:
+                        b_qty = max(1, round(base_qty * heavy_scale))
+                        s_qty = max(0, round(base_qty * light_scale))
+                    else:
+                        b_qty = max(0, round(base_qty * light_scale))
+                        s_qty = max(1, round(base_qty * heavy_scale))
+                else:
+                    b_qty, s_qty = base_qty, base_qty
+
+                # Bid: buying below FV; must not cross best_ask.
+                if remaining_buy > 0 and bid_price < skewed_fv and bid_price < best_ask:
+                    qty = min(remaining_buy, b_qty)
+                    if qty > 0:
+                        orders.append(Order(product, bid_price, qty))
+                        remaining_buy -= qty
+
+                # Ask: selling above FV; must not cross best_bid.
+                if remaining_sell > 0 and ask_price > skewed_fv and ask_price > best_bid:
+                    qty = min(remaining_sell, s_qty)
+                    if qty > 0:
+                        orders.append(Order(product, ask_price, -qty))
+                        remaining_sell -= qty
+
+            return orders
+
+        # ── Legacy single-tier path (IPR) ────────────────────────────────
+        quote_offset = cfg.get("quote_offset", 0)
+        max_qty      = cfg.get("max_passive_qty")
+
         primary_bid = best_bid - quote_offset   # bid+1 when quote_offset=-1
         primary_ask = best_ask + quote_offset   # ask-1 when quote_offset=-1
 
-        # Asymmetric quoting for inventory management.
         if cfg.get("asymmetric_quoting", False):
-            abs_pos = abs(position)
+            abs_pos  = abs(position)
             moderate = cfg.get("asym_moderate_pos", 40)
             critical = cfg.get("asym_critical_pos", 63)
             asym_off = cfg.get("asym_offset", 3)
@@ -363,12 +400,10 @@ class Trader:
                     )
                     our_ask = primary_ask
 
-            # Tighten toward the book when spread is narrow.
             if not is_wide:
                 our_bid = min(our_bid, primary_bid)
                 our_ask = max(our_ask, primary_ask)
 
-            # Never cross the book.
             our_bid = max(our_bid, best_bid)
             our_ask = min(our_ask, best_ask)
         else:
@@ -380,13 +415,6 @@ class Trader:
         if our_ask <= best_bid:
             our_ask = best_ask
 
-        # Max sell constrained by min_long floor.
-        max_sell_passive = (
-            max(0, position - min_long) if min_long > 0 else sell_capacity
-        )
-        effective_sell_cap = min(sell_capacity, max_sell_passive)
-        max_qty = cfg.get("max_passive_qty")
-
         def resolve_qty(capacity, override, max_q):
             if override is not None:
                 return min(capacity, override)
@@ -394,81 +422,15 @@ class Trader:
                 return min(capacity, max_q)
             return capacity
 
-        remaining_buy = buy_capacity
-        remaining_sell = effective_sell_cap
-
-        # ── Primary passive orders (inside the spread) ────────────────────
         if remaining_buy > 0 and our_bid < skewed_fv:
             qty = resolve_qty(remaining_buy, buy_qty_override, max_qty)
             if qty > 0:
                 orders.append(Order(product, our_bid, qty))
-                remaining_buy -= qty
 
         if remaining_sell > 0 and our_ask > skewed_fv:
             qty = resolve_qty(remaining_sell, sell_qty_override, max_qty)
             if qty > 0:
                 orders.append(Order(product, our_ask, -qty))
-                remaining_sell -= qty
-
-        # ── Secondary at-book orders (queue tier 0) ───────────────────────
-        # Only post when not already quoting at the book price, and only
-        # during the pure-MM / moderate zone (asymmetric quoting hasn't
-        # pushed our primary quote to a different level already).
-        if cfg.get("also_quote_at_book", False):
-            at_book_qty = cfg.get("at_book_qty", 0)
-            abs_pos = abs(position)
-            moderate = cfg.get("asym_moderate_pos", 40)
-
-            # Only add the secondary tier when we're in pure-MM territory.
-            if abs_pos < moderate and at_book_qty > 0:
-                # Secondary bid at best_bid (only if different from primary bid).
-                if remaining_buy > 0 and best_bid < skewed_fv and best_bid != our_bid:
-                    qty = min(remaining_buy, at_book_qty)
-                    if qty > 0:
-                        orders.append(Order(product, best_bid, qty))
-
-                # Secondary ask at best_ask (only if different from primary ask).
-                if remaining_sell > 0 and best_ask > skewed_fv and best_ask != our_ask:
-                    qty = min(remaining_sell, at_book_qty)
-                    if qty > 0:
-                        orders.append(Order(product, best_ask, -qty))
-
-        # ── Deeper orders (±2 ticks inside, small volume) ─────────────────
-        # Posts bid+2 / ask-2 for a fixed small qty.  Fills when the spread
-        # compresses enough that a market trade crosses to this level, or
-        # when a sweep clears the ±1 primary tier first.
-        # Only active in pure-MM territory (same guard as the ±0 tier).
-        if cfg.get("also_quote_deeper", False):
-            deeper_qty = cfg.get("deeper_qty", 0)
-            abs_pos = abs(position)
-            moderate = cfg.get("asym_moderate_pos", 40)
-
-            if abs_pos < moderate and deeper_qty > 0:
-                deeper_bid = best_bid + 2
-                deeper_ask = best_ask - 2
-
-                # Guard: don't cross the book and don't duplicate an existing tier.
-                if (
-                    remaining_buy > 0
-                    and deeper_bid < best_ask          # doesn't cross
-                    and deeper_bid < skewed_fv
-                    and deeper_bid != our_bid
-                    and deeper_bid != best_bid
-                ):
-                    qty = min(remaining_buy, deeper_qty)
-                    if qty > 0:
-                        orders.append(Order(product, deeper_bid, qty))
-
-                if (
-                    remaining_sell > 0
-                    and deeper_ask > best_bid          # doesn't cross
-                    and deeper_ask > skewed_fv
-                    and deeper_ask != our_ask
-                    and deeper_ask != best_ask
-                ):
-                    qty = min(remaining_sell, deeper_qty)
-                    if qty > 0:
-                        orders.append(Order(product, deeper_ask, -qty))
 
         return orders
 
@@ -532,19 +494,22 @@ class Trader:
             )
             orders.extend(taken)
 
-            # Step 2 — passive making with optional asymmetric sizing for ACO.
+            # Step 2 — passive making.
+            # Legacy size override applies only to single-tier products (IPR).
+            # Multi-layer products (ACO) handle sizing internally via heavy/light_scale.
             buy_qty_override  = None
             sell_qty_override = None
-            imb_thresh = cfg.get("size_imbalance_threshold")
-            if imb_thresh is not None and abs(position) >= imb_thresh:
-                heavy = cfg.get("size_heavy_qty", 14)
-                light = cfg.get("size_light_qty", 4)
-                if position < 0:
-                    buy_qty_override  = heavy
-                    sell_qty_override = light
-                else:
-                    buy_qty_override  = light
-                    sell_qty_override = heavy
+            if not cfg.get("quote_layers"):
+                imb_thresh = cfg.get("size_imbalance_threshold")
+                if imb_thresh is not None and abs(position) >= imb_thresh:
+                    heavy = cfg.get("size_heavy_qty", 14)
+                    light = cfg.get("size_light_qty", 4)
+                    if position < 0:
+                        buy_qty_override  = heavy
+                        sell_qty_override = light
+                    else:
+                        buy_qty_override  = light
+                        sell_qty_override = heavy
 
             orders.extend(self.make_orders(
                 product, order_depth, base_fv, skewed_fv,
