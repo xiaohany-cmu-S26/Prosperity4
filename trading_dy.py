@@ -2,7 +2,6 @@ from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import Dict, List, Optional, Tuple
 import math
 import json
-import os
 from collections import deque
 from dataclasses import dataclass
 import numpy as np
@@ -1120,8 +1119,7 @@ class Trader:
         else:
             day_idx = persistent.get("day_idx", 0)
 
-        _env_tte = os.environ.get("PROSPERITY4BT_TTE_START")
-        tte_start = int(_env_tte) if _env_tte is not None else ROUND3_TTE_START
+        tte_start = ROUND3_TTE_START
         tte_days = max(
             (tte_start - day_idx) - state.timestamp / TIMESTAMPS_PER_DAY,
             1e-6,
@@ -1334,7 +1332,16 @@ class Trader:
 
         # Delta hedge disabled for testing
 
-        # Logging (req 11)
+        # Market trade log — buyer/seller on every tick that has trades
+        for prod, trades in state.market_trades.items():
+            for t in trades:
+                print(
+                    f"[MKT ts={state.timestamp}] {prod} "
+                    f"buyer={t.buyer} seller={t.seller} "
+                    f"price={t.price} qty={t.quantity}"
+                )
+
+        # Periodic vol/delta summary every 1000 ticks
         if state.timestamp % 1000 == 0:
             biases = {str(k): round(v, 6) for k, v in self.vol_engine.smile_bias.items()}
             print(

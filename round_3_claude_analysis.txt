@@ -708,5 +708,122 @@ APPENDIX B. WHAT NOT TO DO
 
 
 ================================================================================
+APPENDIX C. IMPLEMENTATION POST-MORTEM — ACTUAL BACKTEST RESULTS (2026-04-25)
+================================================================================
+
+After fully implementing the trading_dy.py strategy per the spec above and
+running it against the 3-day historical replay, the following corrections and
+caveats apply. These OVERRIDE the recommendations in Sections 2, 7, 9, and 10
+where they conflict.
+
+--- Baseline scores ---
+
+  trading_dy.py (spec-compliant):     +21,910  (Day0: +2,322  Day1: +13,341  Day2: +6,246)
+  trading.py    (simple sigma=0.20):  +27,150  (Day0: +1,646  Day1: +15,750  Day2: +9,754)
+  447866.py     (unmodified source):  -266,772  (NOT -13,259 as Section 7 states)
+
+The -13,259 figure in Section 7 is from a single-day run with wrong TTE. The
+actual 3-day total for 447866 is -266,772, driven by VFE ema_alpha=0.10 causing
+the bot to chase price and build catastrophic directional VFE positions.
+
+--- Spec recommendations that hurt performance ---
+
+(A) HYDROGEL anchor = 9990
+    Result: -5,800 PnL hit on Day 1 vs anchor = 10000.
+    Correction: use anchor_fv = 10000 and ema_anchor_weight = 0.30.
+    The empirical mean 9990.81 is real, but anchoring FV below market causes
+    systematic downward FV bias on trending days. The anchor is better used
+    as a soft attractor (weight 0.30) at 10000, not a hard re-anchor at 9990.
+
+(B) HYDROGEL tick skew: [(40, 0.5), (80, 1.5), (140, 3.0), (200, 6.0)]
+    Result: -2,000 on Day 0 vs factor skew [(100, 0.0), (160, 0.015), (200, 0.03)].
+    The tick skew kicks in at |pos|=40 which is too early. On trending days,
+    any long position immediately bends FV down, killing long-side profits.
+    Correction: use factor-based skew identical to trading.py for HYDROGEL.
+
+(C) VFE hedge_pressure = 0.02 * net_delta shift on FV
+    Result: -5,000 VFE PnL hit on Day 1 vs no hedge_pressure.
+    The FV shift causes market making to fight strong directional moves.
+    On a trending day (Day 1, +7k HYDROGEL, +4k VFE in trading.py), pressing
+    VFE FV toward a hedge target disrupts normal market making profits.
+    Correction: set hedge_pressure = 0.0; use run_delta_hedge for explicit
+    hedge orders only (and cap hedge qty conservatively at ~10/tick).
+
+(D) Delta hedge (run_delta_hedge) active
+    Result: additional ~500 VFE PnL loss from VFE hedge trades.
+    The aggressive hedge (cross spread at |net_delta| > 30) generates adverse
+    fills when VFE is trending. With basis_arb driving small VEV_4000 positions
+    (delta ≈ 1.0 per contract) and no large short options book, net_delta
+    rarely exceeds 100 in the refactored version.
+    Correction: disable delta hedge for this implementation; net_delta risk is
+    acceptable given position sizes.
+
+(E) Vega-scaled take_threshold: threshold = base * vega(K) / 4000
+    Result: catastrophic. ATM vega ~250-360. max(360/4000, 0.10) = 0.10. So
+    threshold = 2.0 * 0.10 = 0.20 ticks, essentially zero. Caused massive
+    over-trading in earlier buggy runs.
+    Correction: use fixed take_threshold per OPTION_CFG, no vega scaling.
+
+(F) VolEngine smile_bias[5100] = -0.0002 (prior from Section 8)
+    Result: BS FV for VEV_5100 is ~1.5 ticks below sigma=0.20 baseline, causing
+    take/make thresholds to miss trades that trading.py (fixed sigma=0.20) takes.
+    Correction: set smile_bias[5000] = 0.0 and smile_bias[5100] = 0.0. Keep
+    priors only for the structurally persistent strikes (5300, 5400, 5500).
+
+--- What actually works ---
+
+  VEV_4000/4500 basis arb with WIDER thresholds (not ±1/±2 as Section 6 suggests):
+    basis_take_threshold = 7 (VEV_4000), 6 (VEV_4500)
+    basis_make_spread    = 5 (VEV_4000), 4 (VEV_4500)
+    Tight ±1/±2 spreads lead to adverse selection when VFE moves between ticks.
+
+  VolEngine for smile-dip strikes (5400 bias = -0.0006) does improve PnL:
+    VEV_5400: +1,626 on Day 0 (vs lower without bias).
+
+  TTE env var override is essential:
+    PROSPERITY4BT_TTE_START is injected by backtest; without it, TTE=5 for
+    all days when actual TTE is 8/7/6 → catastrophic BS mispricing.
+
+--- Market path divergence ---
+
+IMPORTANT: Trading strategies that place different orders consume different
+historical liquidity. After ~460,000 timestamps within a day, market prices
+seen by trading_dy.py diverge from those seen by trading.py. This means:
+  - Per-product comparisons between strategies are NOT apples-to-apples.
+  - The VEV_5100 +2,061 in trading.py (Day 2) is not reproducible in trading_dy.py
+    because the VFE price trajectory is different by then.
+  - Total scores are comparable; per-product attribution is misleading.
+
+--- Confirmed: dead books (VEV_4500/5000/5100) ---
+
+Consistent with Section 5 (1 trade each in 3 days of historical data).
+VEV_5100 position stays 0 throughout all 30,000 timestamps of trading_dy.py
+backtest, despite submitting passive quotes every tick. Market path divergence
+also means fills observed in trading.py for VEV_5100 are not reproducible.
+Section 5 is correct: do not expect fills on these strikes.
+
+--- Working OPTION_CFG (trading_dy.py final state) ---
+
+  VEV_4000:  basis_arb=True,  basis_take_threshold=7, basis_make_spread=5,  max_make_qty=15
+  VEV_4500:  basis_arb=True,  basis_take_threshold=6, basis_make_spread=4,  max_make_qty=15
+  VEV_5000:  take_threshold=2.0, max_take_qty=20, do_make=True,  max_make_qty=20
+  VEV_5100:  take_threshold=2.0, max_take_qty=20, do_make=True,  max_make_qty=20  (rarely fills)
+  VEV_5200:  take_threshold=3.0, max_take_qty=25, do_make=False
+  VEV_5300:  take_threshold=4.0, max_take_qty=20, do_make=False, sell_cap_mult=1.5, buy_cap_mult=0.5
+  VEV_5400:  take_threshold=2.0, max_take_qty=20, do_make=False, buy_cap_mult=1.5,  sell_cap_mult=0.5
+  VEV_5500:  take_threshold=1.0, max_take_qty=15, do_make=False, sell_cap_mult=1.5, buy_cap_mult=0.5
+  VEV_6000:  max_take_qty=0, do_make=False  (disabled)
+  VEV_6500:  max_take_qty=0, do_make=False  (disabled)
+
+--- Summary corrections to Appendix B ---
+
+(4) REVISE: "Do NOT anchor HYDROGEL_PACK FV at 10000" — WRONG in practice.
+    anchor=9990 causes a systematic downward bias on trending days. The
+    empirical mean 9990 is a property of the observed path, but the mean-
+    reversion anchor at 10000 with weight 0.30 is better for the PnL-maximizing
+    bot. Use anchor=10000, ema_anchor_weight=0.30.
+
+
+================================================================================
 END OF DOCUMENT
 ================================================================================
