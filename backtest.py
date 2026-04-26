@@ -55,6 +55,20 @@ from datamodel import (
 # ── Position limits (mirrors Rust backtester's hardcoded table) ───────────────
 
 KNOWN_POSITION_LIMITS: Dict[str, int] = {
+    # Round 3
+    "HYDROGEL_PACK": 200,
+    "VELVETFRUIT_EXTRACT": 200,
+    "VEV_4000": 300,
+    "VEV_4500": 300,
+    "VEV_5000": 300,
+    "VEV_5100": 300,
+    "VEV_5200": 300,
+    "VEV_5300": 300,
+    "VEV_5400": 300,
+    "VEV_5500": 300,
+    "VEV_6000": 300,
+    "VEV_6500": 300,
+    # Round 1 / 2
     "EMERALDS": 80,
     "TOMATOES": 80,
     "INTARIAN_PEPPER_ROOT": 80,
@@ -105,6 +119,12 @@ def load_algo(algo_path: Path):
             product: cfg.get("limit", default_limit)
             for product, cfg in mod.PRODUCT_CONFIG.items()
         }
+
+    # Pick up option limits declared as OPTION_STRIKES + OPTION_LIMIT.
+    if hasattr(mod, "OPTION_STRIKES") and hasattr(mod, "OPTION_LIMIT"):
+        option_lim = int(mod.OPTION_LIMIT)
+        for product in mod.OPTION_STRIKES:
+            algo_limits.setdefault(product, option_lim)
 
     # Merge: algo limits win; fall through to known table for everything else.
     def limit_for(product: str) -> int:
@@ -729,6 +749,12 @@ def run_backtest(
 
     os.environ["PROSPERITY4BT_ROUND"] = str(round_num)
     os.environ["PROSPERITY4BT_DAY"] = str(day_num)
+    # Round 3 historical data: day_0 = TTE8 (tutorial), day_1 = TTE7 (R1), day_2 = TTE6 (R2).
+    # The live Round 3 submission starts at TTE5, so this env var is absent there.
+    if round_num == 3:
+        os.environ["PROSPERITY4BT_TTE_START"] = str(8 - day_num)
+    else:
+        os.environ.pop("PROSPERITY4BT_TTE_START", None)
 
     trader_data = ""
     state = TradingState(
@@ -938,21 +964,6 @@ def merge_results(
     )
 
 
-def print_checkpoint_summary(result: BacktestResult, ts: int) -> None:
-    """Print a mid-day PnL snapshot at the given timestamp."""
-    rows = [r for r in result.activity_logs if r.timestamp == ts]
-    if not rows:
-        print(f"  (no data at timestamp {ts:,})")
-        return
-    print(f"\n  --- Checkpoint @ ts={ts:,} ---")
-    total = 0.0
-    for row in rows:
-        pnl = row.columns[-1]
-        print(f"  {row.columns[2]}: {pnl:,.0f}")
-        total += pnl
-    print(f"  Total profit: {total:,.0f}")
-
-
 def print_overall_summary(results: List[BacktestResult]) -> None:
     print("\nProfit summary:")
     total_profit = 0.0
@@ -1001,9 +1012,9 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="ROUND_1",
+        default="ROUND_3",
         help=(
-            "Path to data directory (default: ROUND_1). "
+            "Path to data directory (default: ROUND_3). "
             "Also accepts prosperity_rust_backtester-main/datasets for the "
             "bundled Rust backtester datasets."
         ),
@@ -1011,8 +1022,8 @@ def main():
     parser.add_argument(
         "--round",
         type=int,
-        default=1,
-        help="Round number (default: 1)",
+        default=3,
+        help="Round number (default: 3)",
     )
     parser.add_argument(
         "--day",
@@ -1138,8 +1149,6 @@ def main():
             config,
         )
 
-        if day_num == -2:
-            print_checkpoint_summary(result, 100_000)
         print_day_summary(result)
         results.append(result)
 
