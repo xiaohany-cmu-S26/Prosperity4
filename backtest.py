@@ -30,6 +30,7 @@ Usage:
 import argparse
 import importlib.util
 import json
+import math
 import os
 import re
 import sys
@@ -55,7 +56,7 @@ from datamodel import (
 # ── Position limits (mirrors Rust backtester's hardcoded table) ───────────────
 
 KNOWN_POSITION_LIMITS: Dict[str, int] = {
-    # Round 3
+    # Round 3 / 4
     "HYDROGEL_PACK": 200,
     "VELVETFRUIT_EXTRACT": 200,
     "VEV_4000": 300,
@@ -749,9 +750,10 @@ def run_backtest(
 
     os.environ["PROSPERITY4BT_ROUND"] = str(round_num)
     os.environ["PROSPERITY4BT_DAY"] = str(day_num)
-    # Round 3 historical data: day_0 = TTE8 (tutorial), day_1 = TTE7 (R1), day_2 = TTE6 (R2).
-    # The live Round 3 submission starts at TTE5, so this env var is absent there.
-    if round_num == 3:
+    # Round 3/4 historical data uses TTE formula: TTE = 8 - day_num.
+    # Round 3: day_0=TTE8 (tutorial), day_1=TTE7 (R1), day_2=TTE6 (R2); live R3 starts TTE5.
+    # Round 4: day_1=TTE7 (R1), day_2=TTE6 (R2), day_3=TTE5 (R3); live R4 starts TTE4.
+    if round_num in (3, 4):
         os.environ["PROSPERITY4BT_TTE_START"] = str(8 - day_num)
     else:
         os.environ.pop("PROSPERITY4BT_TTE_START", None)
@@ -904,6 +906,28 @@ def write_json_output(output_file: Path, merged: BacktestResult) -> None:
 
 # ── CLI Helpers ───────────────────────────────────────────────────────────────
 
+def compute_sharpe(activity_logs: List[ActivityLogRow]) -> Optional[float]:
+    """Sharpe ratio: mean / std of per-timestamp total-PnL increments (unannualized)."""
+    pnl_by_ts: Dict[int, float] = defaultdict(float)
+    for row in activity_logs:
+        pnl_by_ts[row.timestamp] += row.columns[-1]
+
+    sorted_ts = sorted(pnl_by_ts)
+    if len(sorted_ts) < 2:
+        return None
+
+    pnl_series = [pnl_by_ts[ts] for ts in sorted_ts]
+    increments = [pnl_series[i] - pnl_series[i - 1] for i in range(1, len(pnl_series))]
+
+    n = len(increments)
+    mean = sum(increments) / n
+    variance = sum((x - mean) ** 2 for x in increments) / (n - 1)
+    std = math.sqrt(variance) if variance > 0 else 0.0
+    if std == 0:
+        return None
+    return mean / std
+
+
 def print_day_summary(result: BacktestResult) -> None:
     last_timestamp = result.activity_logs[-1].timestamp
 
@@ -921,6 +945,9 @@ def print_day_summary(result: BacktestResult) -> None:
     for line in reversed(product_lines):
         print(line)
     print(f"  Total profit: {total_profit:,.0f}")
+    sharpe = compute_sharpe(result.activity_logs)
+    if sharpe is not None:
+        print(f"  Sharpe ratio: {sharpe:.4f}")
 
 
 def merge_results(
@@ -967,6 +994,7 @@ def merge_results(
 def print_overall_summary(results: List[BacktestResult]) -> None:
     print("\nProfit summary:")
     total_profit = 0.0
+    all_logs: List[ActivityLogRow] = []
     for result in results:
         last_ts = result.activity_logs[-1].timestamp
         profit = 0.0
@@ -974,9 +1002,15 @@ def print_overall_summary(results: List[BacktestResult]) -> None:
             if row.timestamp != last_ts:
                 break
             profit += row.columns[-1]
-        print(f"  Round {result.round_num} day {result.day_num}: {profit:,.0f}")
+        sharpe = compute_sharpe(result.activity_logs)
+        sharpe_str = f"  sharpe {sharpe:.4f}" if sharpe is not None else ""
+        print(f"  Round {result.round_num} day {result.day_num}: {profit:,.0f}{sharpe_str}")
         total_profit += profit
+        all_logs.extend(result.activity_logs)
     print(f"  Total profit: {total_profit:,.0f}")
+    overall_sharpe = compute_sharpe(all_logs)
+    if overall_sharpe is not None:
+        print(f"  Overall Sharpe ratio: {overall_sharpe:.4f}")
 
 
 def _resolve_data_dir(raw: str) -> Path:
@@ -1012,9 +1046,9 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="ROUND_3",
+        default="ROUND_4",
         help=(
-            "Path to data directory (default: ROUND_3). "
+            "Path to data directory (default: ROUND_4). "
             "Also accepts prosperity_rust_backtester-main/datasets for the "
             "bundled Rust backtester datasets."
         ),
@@ -1022,8 +1056,8 @@ def main():
     parser.add_argument(
         "--round",
         type=int,
-        default=3,
-        help="Round number (default: 3)",
+        default=4,
+        help="Round number (default: 4)",
     )
     parser.add_argument(
         "--day",

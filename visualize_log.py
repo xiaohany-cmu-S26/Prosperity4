@@ -615,11 +615,11 @@ def build_single_log_html(fig: go.Figure, statesheet: dict, summary: list[dict],
   <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
   <style>
     * {{ box-sizing: border-box; }}
-    body {{ background:#111; color:#eee; font-family:Arial,sans-serif; margin:0; display:flex; flex-direction:column; height:100vh; }}
-    .toolbar {{ padding:12px 16px; border-bottom:1px solid #333; display:flex; gap:10px; align-items:center; flex-shrink:0; }}
-    .container {{ display: flex; gap: 0; flex: 1; overflow: hidden; width: 100%; }}
-    #chart {{ flex: 1; overflow: auto; min-width: 0; }}
-    .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; }}
+    body {{ background:#111; color:#eee; font-family:Arial,sans-serif; margin:0; }}
+    .toolbar {{ position:sticky; top:0; z-index:100; height:48px; background:#111; padding:0 16px; border-bottom:1px solid #333; display:flex; gap:10px; align-items:center; }}
+    .container {{ display: flex; gap: 0; width: 100%; align-items: flex-start; }}
+    #chart {{ flex: 1; min-width: 0; }}
+    .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; position: sticky; top: 48px; height: calc(100vh - 48px); }}
     .summary {{ margin-bottom: 24px; }}
     .summary h3 {{ margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color:#aaa; font-weight: 600; }}
     .range-label {{ font-size: 10px; color: #666; margin-bottom: 8px; }}
@@ -869,12 +869,12 @@ def build_dashboard_html(figures: dict[str, dict], summaries: dict[str, list[dic
   <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
   <style>
     * {{ box-sizing: border-box; }}
-    body {{ background:#111; color:#eee; font-family:Arial,sans-serif; margin:0; display:flex; flex-direction:column; height:100vh; }}
-    .toolbar {{ padding:12px 16px; border-bottom:1px solid #333; display:flex; gap:10px; align-items:center; flex-shrink:0; }}
+    body {{ background:#111; color:#eee; font-family:Arial,sans-serif; margin:0; }}
+    .toolbar {{ position:sticky; top:0; z-index:100; height:48px; background:#111; padding:0 16px; border-bottom:1px solid #333; display:flex; gap:10px; align-items:center; }}
     select {{ background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:6px; padding:6px 10px; min-width:220px; }}
-    .container {{ display: flex; gap: 0; flex: 1; overflow: hidden; width: 100%; }}
-    #chart {{ flex: 1; overflow: auto; min-width: 0; }}
-    .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; }}
+    .container {{ display: flex; gap: 0; width: 100%; align-items: flex-start; }}
+    #chart {{ flex: 1; min-width: 0; }}
+    .sidebar {{ width: 380px; overflow-y: auto; border-left: 1px solid #333; padding: 16px; flex-shrink: 0; background: #0a0a0a; min-width: 380px; position: sticky; top: 48px; height: calc(100vh - 48px); }}
     .summary {{ margin-bottom: 24px; }}
     .summary h3 {{ margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color:#aaa; font-weight: 600; }}
     .range-label {{ font-size: 10px; color: #666; margin-bottom: 8px; }}
