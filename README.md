@@ -102,10 +102,10 @@ Any `.py` file with:
 
 ```bash
 # Dashboard with all logs (dropdown selector)
-python3 visualize_log.py
+python visualize_log.py
 
 # Single log visualization
-python3 visualize_log.py --log 3179/3179
+python visualize_log.py --log 3179/3179
 ```
 
 Features:

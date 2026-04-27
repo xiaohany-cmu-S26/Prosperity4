@@ -995,18 +995,30 @@ def print_overall_summary(results: List[BacktestResult]) -> None:
     print("\nProfit summary:")
     total_profit = 0.0
     all_logs: List[ActivityLogRow] = []
+    product_totals: Dict[str, float] = defaultdict(float)
     for result in results:
         last_ts = result.activity_logs[-1].timestamp
         profit = 0.0
+        day_products: Dict[str, float] = {}
         for row in reversed(result.activity_logs):
             if row.timestamp != last_ts:
                 break
-            profit += row.columns[-1]
+            product = row.columns[2]
+            pnl = row.columns[-1]
+            day_products[product] = pnl
+            profit += pnl
+        for product, pnl in day_products.items():
+            product_totals[product] += pnl
         sharpe = compute_sharpe(result.activity_logs)
         sharpe_str = f"  sharpe {sharpe:.4f}" if sharpe is not None else ""
         print(f"  Round {result.round_num} day {result.day_num}: {profit:,.0f}{sharpe_str}")
+        for product, pnl in sorted(day_products.items()):
+            print(f"    {product}: {pnl:,.0f}")
         total_profit += profit
         all_logs.extend(result.activity_logs)
+    print(f"\n  Per-asset totals:")
+    for product, pnl in sorted(product_totals.items()):
+        print(f"    {product}: {pnl:,.0f}")
     print(f"  Total profit: {total_profit:,.0f}")
     overall_sharpe = compute_sharpe(all_logs)
     if overall_sharpe is not None:

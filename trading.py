@@ -1,16 +1,4 @@
-try:
-    from datamodel import Order, OrderDepth, TradingState
-except ImportError:
-    class Order:
-        def __init__(self, symbol, price, quantity):
-            self.symbol = symbol; self.price = price; self.quantity = quantity
-    class OrderDepth:
-        def __init__(self):
-            self.buy_orders = {}; self.sell_orders = {}
-    class TradingState:
-        def __init__(self):
-            self.timestamp = 0; self.traderData = ""; self.position = {}; self.order_depths = {}
-
+from datamodel import Order, OrderDepth, Trade, TradingState
 from typing import Any, Dict, List, Optional, Tuple
 import json
 import math
@@ -75,44 +63,18 @@ class Trader:
     HYDRO_SWING_ENABLED = True
     HYDRO_SWING_CAP = 200
     HYDRO_SWING_SIZE = 40
-    # Change 6: adaptive HP thresholds via EMA + offsets (offsets = threshold - hist_mean)
-    HYDRO_LONG_ENTRY_OFFSET   = -29   # 9950 - 9979
-    HYDRO_LONG_EXIT_OFFSET    =   6   # 9985 - 9979
-    HYDRO_SHORT_ENTRY_OFFSET  =   1   # 9980 - 9979
-    HYDRO_SHORT_EXIT_OFFSET   = -29   # 9950 - 9979
-    HYDRO_EMA_ALPHA           = 0.0005
-    HYDRO_EMA_HIST_MEAN       = 9979.0
-    HYDRO_EMA_BOOTSTRAP_TICKS = 1000
+    HYDRO_LONG_ENTRY = 9970
+    HYDRO_LONG_EXIT = 9986
+    HYDRO_SHORT_ENTRY = 10020
+    HYDRO_SHORT_EXIT = 10006
+    HYDRO_SCALE_OUT_POS = 180
+    HYDRO_SCALE_OUT_SIZE = 4
+    HYDRO_SCALE_OUT_EDGE = 20
+    HYDRO_PASSIVE_SIZE = 6
+    HYDRO_PASSIVE_LOW = 9994
+    HYDRO_PASSIVE_HIGH = 9998
 
-    # Change 3: EMA-offset swing thresholds. Offsets derived from day-2 mean.
-    PRICE_SWING_OFFSETS = {
-        "VELVETFRUIT_EXTRACT": {
-            "long_entry": -13, "long_exit": 12, "short_entry": 12, "short_exit": -16,
-            "cap": 200, "levels": 2,
-        },
-        "VEV_4000": {
-            "long_entry": -5, "long_exit": 6, "short_entry": 1, "short_exit": -9,
-            "cap": 300, "levels": 2,
-        },
-        "VEV_4500": {
-            "long_entry": -10, "long_exit": 1, "short_entry": 1, "short_exit": -14,
-            "cap": 300, "levels": 2,
-        },
-        "VEV_5000": {
-            "long_entry": -14, "long_exit": 1, "short_entry": 6, "short_exit": -17,
-            "cap": 300, "levels": 2,
-        },
-        "VEV_5100": {
-            "long_entry": -16, "long_exit": 3, "short_entry": 3, "short_exit": -16,
-            "cap": 300, "levels": 2,
-        },
-        "VEV_5200": {
-            "long_entry": -10, "long_exit": 3, "short_entry": 3, "short_exit": -10,
-            "cap": 300, "levels": 2,
-        },
-    }
-    # Hardcoded fallback used before swing EMA bootstraps (< SWING_EMA_BOOTSTRAP ticks)
-    PRICE_SWING_FALLBACK = {
+    PRICE_SWING_CONFIG = {
         "VELVETFRUIT_EXTRACT": (5246, 5271, 5271, 5243, 200, 2),
         "VEV_4000": (1256, 1266, 1262, 1256, 300, 2),
         "VEV_4500": (755, 766, 766, 751, 300, 2),
@@ -120,8 +82,6 @@ class Trader:
         "VEV_5100": (162, 181, 181, 162, 300, 2),
         "VEV_5200": (92, 105, 105, 92, 300, 2),
     }
-    SWING_EMA_ALPHA     = 0.0005
-    SWING_EMA_BOOTSTRAP = 200
 
     TIME_VALUE_OPTIONS: Tuple[str, ...] = ("VEV_5300", "VEV_5400", "VEV_5500")
     TIME_VALUE_MEAN = {
@@ -142,12 +102,11 @@ class Trader:
         "VEV_5400": 0.65,
         "VEV_5500": 0.50,
     }
-    # Change 4: VEV_5500 short entry z lowered from 0.80 to 0.45
     TIME_VALUE_SHORT_ENTRY_Z = {
         "VEV_5200": 0.65,
         "VEV_5300": 0.70,
         "VEV_5400": 0.50,
-        "VEV_5500": 0.45,
+        "VEV_5500": 0.80,
     }
     TIME_VALUE_LONG_CAP = {
         "VEV_5200": 200,
@@ -182,21 +141,17 @@ class Trader:
     TIME_VALUE_STD_FLOOR_RATIO = 0.6
     TIME_VALUE_MIN_OBS = 0
 
-    # Change 1: full delta hedging, all active strikes included
     OPTION_DELTAS = {
         "VEV_4000": 1.00,
-        "VEV_4500": 1.00,
-        "VEV_5000": 0.95,
-        "VEV_5100": 0.85,
         "VEV_5200": 0.56,
         "VEV_5300": 0.33,
         "VEV_5400": 0.13,
         "VEV_5500": 0.06,
     }
-    VFE_OPTION_HEDGE_RATIO   = 1.0
-    VFE_OPTION_HEDGE_TRIGGER = 12
-    VFE_OPTION_HEDGE_CLIP    = 150
-    VFE_OPTION_HEDGE_SLICE   = 25
+    VFE_OPTION_HEDGE_RATIO = 0.0
+    VFE_OPTION_HEDGE_TRIGGER = 18
+    VFE_OPTION_HEDGE_CLIP = 80
+    VFE_OPTION_HEDGE_SLICE = 12
 
     DEEP_ITM_TAKE_SIZE = {
         "VEV_4000": 8,
@@ -205,25 +160,100 @@ class Trader:
         "VEV_4000": 6,
     }
 
-    TV_EMA_ALPHA    = 1.00
+    TV_EMA_ALPHA = 1.00
     TV_PRIOR_WEIGHT = 0.60
+    TV_CYCLE_ALPHA = 0.20
+    TV_MATURE_COUNT = 35
+    TV_COMPRESSED_GAP_SIGMAS = 0.75
+    TV_SURFACE_ALPHA = 0.18
+    TV_SURFACE_MIN_COUNT = 25
+    TV_SURFACE_MIN_HOLD = 12
+    TV_SURFACE_STD_MULT = 0.65
+    TV_SURFACE_EDGE_FLOOR = 0.8
+    TV_SURFACE_CLIP = 24
+    TV_SURFACE_CORE = {
+        "VEV_5300": 180,
+        "VEV_5400": 240,
+    }
+    OTM_EVENT_SCALE = 18.0
+    OTM_EVENT_CLIP = 2.5
 
-    LOG_EVERY = 1000
+    # Conservative round-4 counterparty overlay.
+    # Positive trader weights mean "their direction tends to continue".
+    # Negative trader weights mean "fade their direction".
+    MARK_WEIGHTS = {
+        "HYDROGEL_PACK": {
+            "Mark 14": 0.9,
+            "Mark 38": -0.9,
+        },
+        "VELVETFRUIT_EXTRACT": {
+            "Mark 01": 0.9,
+            "Mark 14": 0.7,
+            "Mark 67": 0.4,
+            "Mark 55": -0.9,
+            "Mark 49": -0.4,
+        },
+        "VEV_4000": {
+            "Mark 14": 0.9,
+            "Mark 38": -0.9,
+        },
+        "VEV_5200": {
+            "Mark 14": 0.5,
+            "Mark 01": 0.4,
+            "Mark 22": -0.6,
+        },
+        "VEV_5300": {
+            "Mark 01": -0.15,
+            "Mark 14": -0.25,
+            "Mark 22": 0.30,
+        },
+        "VEV_5400": {
+            "Mark 01": -0.04,
+            "Mark 14": -0.08,
+            "Mark 22": 0.10,
+        },
+        "VEV_5500": {
+            "Mark 01": -0.08,
+            "Mark 14": -0.12,
+            "Mark 22": 0.18,
+        },
+    }
 
-    # Change 2: 5300/5400/5500 butterfly arb
-    FLY_5300_5400_5500_MEAN_PRIOR = 24.36
-    FLY_5300_5400_5500_STD_PRIOR  = 1.0
-    FLY_EWMA_ALPHA = 0.05
-    FLY_PRIOR_W    = 0.6
-    FLY_ENTRY_Z    = 0.75
-    FLY_EXIT_Z     = 0.2
-    FLY_MAX_QTY    = 100
-    FLY_LEG_SIZE   = 20
+    MARK_SCALE = {
+        "HYDROGEL_PACK": 40.0,
+        "VELVETFRUIT_EXTRACT": 35.0,
+        "VEV_4000": 22.0,
+        "VEV_5200": 15.0,
+        "VEV_5300": 12.0,
+        "VEV_5400": 12.0,
+        "VEV_5500": 12.0,
+    }
 
-    # Change 5: end-of-window position flatten
-    ROUND_END_TS       = 1_000_000
-    FLATTEN_BEGIN_TS   = 850_000
-    FLATTEN_FINAL_FRAC = 0.15
+    MARK_CLIP = {
+        "HYDROGEL_PACK": 2.5,
+        "VELVETFRUIT_EXTRACT": 2.5,
+        "VEV_4000": 2.5,
+        "VEV_5200": 2.0,
+        "VEV_5300": 1.4,
+        "VEV_5400": 0.6,
+        "VEV_5500": 0.8,
+    }
+
+    MARK_DECAY = 0.88
+
+    PRICE_SATELLITE_CONFIG = {}
+    TV_SATELLITE_CONFIG = {
+        "VEV_5300": (180, 12, 1.8, 0.55, 0.35, 24),
+        "VEV_5400": (240, 20, 0.8, 0.55, 0.40, 12),
+    }
+
+    # Hydro and VFE often move like opposite sides of the same spread. Keep the
+    # cross signal small: day 1 is not cleanly inverse, while days 2/3 are.
+    MIRROR_HYDRO_SCALE = 35.0
+    MIRROR_VFE_SCALE = 30.0
+    MIRROR_Z_CLIP = 2.5
+    MIRROR_HYDRO_SHIFT_PER_VFE_Z = 3.0
+    MIRROR_PRICE_SHIFT_PER_HYDRO_Z = 2.0
 
     def bid(self):
         return 15
@@ -239,21 +269,11 @@ class Trader:
             if book is not None:
                 books[product] = book
                 self._update_memory(memory, product, book)
+        self._update_mirror_memory(memory, books)
 
-        # Change 3: update slow swing EMAs for all products in PRICE_SWING_OFFSETS
-        for product in self.PRICE_SWING_OFFSETS:
-            if product in books:
-                self._update_swing_ema(memory, product, books[product]["mid"])
-
-        # Change 6: update HP EMA
-        if "HYDROGEL_PACK" in books:
-            self._update_hp_ema(memory, books["HYDROGEL_PACK"]["mid"])
-
-        # Change 5: compute flatten factor (1.0 before FLATTEN_BEGIN_TS, scales to FLATTEN_FINAL_FRAC at ROUND_END_TS)
-        progress = max(0.0, (state.timestamp - self.FLATTEN_BEGIN_TS) /
-                       (self.ROUND_END_TS - self.FLATTEN_BEGIN_TS))
-        progress = min(1.0, progress)
-        flatten_factor = 1.0 - progress * (1.0 - self.FLATTEN_FINAL_FRAC)
+        self._decay_mark_memory(memory)
+        self._ingest_mark_trades(memory, state.market_trades)
+        self._update_hold_memory(memory, state.position)
 
         fairs: Dict[str, float] = {}
         deltas: Dict[str, float] = {}
@@ -281,77 +301,52 @@ class Trader:
                     self._update_time_value_memory(
                         memory, product, books[product]["mid"], spot_mid
                     )
+            if "VEV_5300" in books and "VEV_5400" in books:
+                self._update_tv_surface_memory(
+                    memory, spot_mid, books["VEV_5300"]["mid"], books["VEV_5400"]["mid"]
+                )
 
-        # Step 6: HYDROGEL_PACK with adaptive thresholds (Change 6) and scaled cap (Change 5)
         if "HYDROGEL_PACK" in fairs:
             self._trade_hydro(
                 "HYDROGEL_PACK", books["HYDROGEL_PACK"], fairs["HYDROGEL_PACK"],
-                memory, state.position, result, used,
-                cap_scale=flatten_factor,
+                memory, state.position, result, used
             )
 
-        # Step 7: VFE and VEV_4000/4500/5000/5100/5200 via price-swing with EMA offsets (Changes 3, 5)
-        if self.UNDERLYING in fairs and self.UNDERLYING not in self.PRICE_SWING_OFFSETS:
+        if self.UNDERLYING in fairs and self.UNDERLYING not in self.PRICE_SWING_CONFIG:
             self._trade_spot(
                 self.UNDERLYING, books[self.UNDERLYING], fairs[self.UNDERLYING],
                 state.position, result, used
             )
 
-        for product in self.PRICE_SWING_OFFSETS:
+        for product in self.PRICE_SWING_CONFIG:
             if product in books:
                 self._trade_price_swing(
-                    product, books[product], memory, state.position, result, used,
-                    cap_scale=flatten_factor,
+                    product, books[product], memory, state.position, result, used
                 )
 
         for product in ("VEV_4000",):
-            if product in fairs and product not in self.PRICE_SWING_OFFSETS:
+            if product in fairs and product not in self.PRICE_SWING_CONFIG:
                 self._trade_deep_itm_parity(
                     product, books[product], fairs[product], state.position, result, used
                 )
 
         if self.UNDERLYING in books:
             spot_mid = books[self.UNDERLYING]["mid"]
-
-            # Step 8: VEV_5300/5400/5500 time-value with K=5500 z fix (Change 4) and scaled cap (Change 5)
             for product in self.TIME_VALUE_OPTIONS:
                 if product in books:
                     self._trade_time_value_call(
                         product, books[product], spot_mid, memory,
                         state.position, result, used,
-                        cap_scale=flatten_factor,
                     )
-
-            # Step 9: butterfly arb on 5300/5400/5500 (Change 2), qty scaled (Change 5)
-            fly_legs = ("VEV_5300", "VEV_5400", "VEV_5500")
-            if all(p in books for p in fly_legs):
-                fly_max = max(1, int(self.FLY_MAX_QTY * flatten_factor))
-                self._trade_fly_5300_5400_5500(
-                    books, state.position, memory, result, used, max_qty=fly_max
-                )
-
-            # Step 10: delta hedge — NOT scaled; remains fully active (Change 1)
+            self._trade_tv_surface_rotation(
+                books, spot_mid, memory, state.position, result, used
+            )
             self._hedge_option_delta(
                 books[self.UNDERLYING], state.position, result, used
             )
 
-        # Periodic log with netΔ (Change 1e)
-        tick = memory.get("tick", 0) + 1
-        memory["tick"] = tick
-        if tick % self.LOG_EVERY == 0:
-            net_delta = sum(
-                self.OPTION_DELTAS.get(p, 0.0) * state.position.get(p, 0)
-                for p in self.OPTION_DELTAS
-            )
-            print(
-                f"t={state.timestamp} tick={tick} netΔ={net_delta:.1f} "
-                f"fly_pos={memory.get('fly_pos', 0)} flatten={flatten_factor:.3f}"
-            )
-
         trader_data = json.dumps(memory, separators=(",", ":"))
         return result, 0, trader_data
-
-    # ── memory helpers ────────────────────────────────────────────────────────
 
     def _load_memory(self, trader_data: str) -> Dict[str, Any]:
         if trader_data:
@@ -362,22 +357,6 @@ class Trader:
             except Exception:
                 pass
         return {"products": {}}
-
-    def _update_swing_ema(self, memory: Dict[str, Any], product: str, mid: float) -> None:
-        item = memory.setdefault("swing_ema", {}).setdefault(product, {"mid": mid, "count": 0})
-        if item["count"] == 0:
-            item["mid"] = mid
-        else:
-            item["mid"] = (1.0 - self.SWING_EMA_ALPHA) * item["mid"] + self.SWING_EMA_ALPHA * mid
-        item["count"] = item["count"] + 1
-
-    def _update_hp_ema(self, memory: Dict[str, Any], mid: float) -> None:
-        item = memory.setdefault("hp_ema", {"mid": self.HYDRO_EMA_HIST_MEAN, "count": 0})
-        if item["count"] == 0:
-            item["mid"] = self.HYDRO_EMA_HIST_MEAN
-        else:
-            item["mid"] = (1.0 - self.HYDRO_EMA_ALPHA) * item["mid"] + self.HYDRO_EMA_ALPHA * mid
-        item["count"] = item["count"] + 1
 
     def _book(self, depth: OrderDepth) -> Optional[Dict[str, Any]]:
         if not depth.buy_orders or not depth.sell_orders:
@@ -418,6 +397,7 @@ class Trader:
             item["prev"] = mid
             item["last"] = mid
             item["vol"] = max(1.0, book["spread"] / 2.0)
+            item["mark_bias"] = 0.0
             return
         last = float(item.get("last", mid))
         item["prev"] = last
@@ -425,6 +405,110 @@ class Trader:
         item["slow"] = 0.01 * mid + 0.99 * float(item.get("slow", mid))
         item["vol"] = 0.08 * abs(mid - last) + 0.92 * float(item.get("vol", 1.0))
         item["last"] = mid
+
+    def _decay_mark_memory(self, memory: Dict[str, Any]) -> None:
+        for item in memory.setdefault("products", {}).values():
+            item["mark_bias"] = float(item.get("mark_bias", 0.0)) * self.MARK_DECAY
+            item["otm_sell_bias"] = float(item.get("otm_sell_bias", 0.0)) * self.MARK_DECAY
+
+    def _ingest_mark_trades(
+        self, memory: Dict[str, Any], market_trades: Dict[str, List[Trade]]
+    ) -> None:
+        for product, trades in market_trades.items():
+            weights = self.MARK_WEIGHTS.get(product)
+            if weights:
+                item = memory.setdefault("products", {}).setdefault(product, {})
+                bias = float(item.get("mark_bias", 0.0))
+                for trade in trades:
+                    buyer_w = weights.get(trade.buyer, 0.0)
+                    seller_w = weights.get(trade.seller, 0.0)
+                    signed = buyer_w - seller_w
+                    if signed == 0.0:
+                        continue
+                    qty = max(1, int(trade.quantity))
+                    bias += signed * qty / self.MARK_SCALE[product]
+                clip = self.MARK_CLIP[product]
+                item["mark_bias"] = max(-clip, min(clip, bias))
+
+            for trade in trades:
+                self._ingest_otm_flow(memory, product, trade)
+
+    def _mark_bias(self, memory: Dict[str, Any], product: str) -> float:
+        item = memory.get("products", {}).get(product, {})
+        return float(item.get("mark_bias", 0.0))
+
+    def _update_mirror_memory(
+        self, memory: Dict[str, Any], books: Dict[str, Dict[str, Any]]
+    ) -> None:
+        hydro = books.get("HYDROGEL_PACK")
+        vfe = books.get(self.UNDERLYING)
+        if hydro is None or vfe is None:
+            return
+
+        products = memory.setdefault("products", {})
+        hydro_item = products.get("HYDROGEL_PACK", {})
+        vfe_item = products.get(self.UNDERLYING, {})
+        hydro_slow = float(hydro_item.get("slow", hydro["mid"]))
+        vfe_slow = float(vfe_item.get("slow", vfe["mid"]))
+
+        hydro_z = (hydro["mid"] - hydro_slow) / self.MIRROR_HYDRO_SCALE
+        vfe_z = (vfe["mid"] - vfe_slow) / self.MIRROR_VFE_SCALE
+        hydro_z = max(-self.MIRROR_Z_CLIP, min(self.MIRROR_Z_CLIP, hydro_z))
+        vfe_z = max(-self.MIRROR_Z_CLIP, min(self.MIRROR_Z_CLIP, vfe_z))
+
+        mirror = memory.setdefault("mirror", {})
+        mirror["hydro_z"] = hydro_z
+        mirror["vfe_z"] = vfe_z
+
+    def _mirror_hydro_shift(self, memory: Dict[str, Any]) -> float:
+        vfe_z = float(memory.get("mirror", {}).get("vfe_z", 0.0))
+        return -self.MIRROR_HYDRO_SHIFT_PER_VFE_Z * vfe_z
+
+    def _mirror_price_shift(self, memory: Dict[str, Any], product: str) -> float:
+        hydro_z = float(memory.get("mirror", {}).get("hydro_z", 0.0))
+        return -self.MIRROR_PRICE_SHIFT_PER_HYDRO_Z * hydro_z * self.OPTION_DELTAS.get(product, 0.0)
+
+    def _bump_otm_sell_bias(self, memory: Dict[str, Any], delta: float) -> None:
+        if delta == 0.0:
+            return
+        for product in ("VEV_5300", "VEV_5400"):
+            item = memory.setdefault("products", {}).setdefault(product, {})
+            nxt = float(item.get("otm_sell_bias", 0.0)) + delta
+            item["otm_sell_bias"] = max(-self.OTM_EVENT_CLIP, min(self.OTM_EVENT_CLIP, nxt))
+
+    def _ingest_otm_flow(self, memory: Dict[str, Any], product: str, trade: Trade) -> None:
+        qty = max(1, int(trade.quantity))
+        delta = 0.0
+        if product in {"VEV_5300", "VEV_5400", "VEV_5500", "VEV_6000", "VEV_6500"}:
+            if trade.seller == "Mark 22" and trade.buyer in {"Mark 01", "Mark 14"}:
+                mult = 1.15 if trade.buyer == "Mark 14" else 0.90
+                delta += mult * qty / self.OTM_EVENT_SCALE
+            elif trade.buyer == "Mark 22" and trade.seller in {"Mark 01", "Mark 14"}:
+                mult = 1.15 if trade.seller == "Mark 14" else 0.90
+                delta -= mult * qty / self.OTM_EVENT_SCALE
+        elif product == self.UNDERLYING:
+            if trade.buyer == "Mark 55" and trade.seller in {"Mark 14", "Mark 01"}:
+                delta -= 0.35 * qty / self.OTM_EVENT_SCALE
+            elif trade.buyer == "Mark 67" and trade.seller in {"Mark 22", "Mark 49"}:
+                delta -= 0.25 * qty / self.OTM_EVENT_SCALE
+            elif trade.seller == "Mark 55" and trade.buyer in {"Mark 14", "Mark 01"}:
+                delta += 0.20 * qty / self.OTM_EVENT_SCALE
+        self._bump_otm_sell_bias(memory, delta)
+
+    def _update_hold_memory(
+        self, memory: Dict[str, Any], position: Dict[str, int]
+    ) -> None:
+        cfg: Dict[str, Tuple[int, ...]] = dict(self.TV_SATELLITE_CONFIG)
+        for product, vals in cfg.items():
+            item = memory.setdefault("products", {}).setdefault(product, {})
+            core_pos = int(vals[0])
+            pos = position.get(product, 0)
+            hold_ticks = int(item.get("long_hold_ticks", 0))
+            if pos >= core_pos:
+                hold_ticks += 1
+            else:
+                hold_ticks = 0
+            item["long_hold_ticks"] = hold_ticks
 
     def _update_time_value_memory(
         self, memory: Dict[str, Any], product: str, option_mid: float, spot_mid: float
@@ -444,6 +528,28 @@ class Trader:
         item["tv_mean"] = new_mean
         item["tv_var"] = max(new_var, 1e-6)
         item["tv_count"] = int(item.get("tv_count", 0)) + 1
+
+        cycle_mean = float(item.get("tv_cycle_mean", prior_mean))
+        cycle_var = float(item.get("tv_cycle_var", prior_var))
+        ca = self.TV_CYCLE_ALPHA
+        cycle_diff = tv - cycle_mean
+        item["tv_cycle_mean"] = (1.0 - ca) * cycle_mean + ca * tv
+        item["tv_cycle_var"] = max((1.0 - ca) * cycle_var + ca * cycle_diff * cycle_diff, 1e-6)
+
+    def _update_tv_surface_memory(
+        self, memory: Dict[str, Any], spot_mid: float, tv5300_mid: float, tv5400_mid: float
+    ) -> None:
+        left_tv = tv5300_mid - max(spot_mid - self.STRIKES["VEV_5300"], 0.0)
+        right_tv = tv5400_mid - max(spot_mid - self.STRIKES["VEV_5400"], 0.0)
+        spread = left_tv - right_tv
+        surface = memory.setdefault("surface", {})
+        mean = float(surface.get("vev_5300_5400_mean", spread))
+        var = float(surface.get("vev_5300_5400_var", 16.0))
+        a = self.TV_SURFACE_ALPHA
+        diff = spread - mean
+        surface["vev_5300_5400_mean"] = (1.0 - a) * mean + a * spread
+        surface["vev_5300_5400_var"] = max((1.0 - a) * var + a * diff * diff, 1e-6)
+        surface["vev_5300_5400_count"] = int(surface.get("vev_5300_5400_count", 0)) + 1
 
     def _adaptive_tv_stats(self, memory: Dict[str, Any], product: str) -> Tuple[float, float]:
         item = memory.get("products", {}).get(product, {})
@@ -468,8 +574,6 @@ class Trader:
             return book["mid"] + 0.35 * micro_edge + 0.04 * (ema - slow) + 0.025 * (self.HYDRO_ANCHOR - slow)
         return book["mid"] + 0.20 * micro_edge + 0.04 * (ema - slow) + 0.015 * (self.VELVET_ANCHOR - slow)
 
-    # ── trading strategies ────────────────────────────────────────────────────
-
     def _trade_hydro(
         self,
         product: str,
@@ -479,10 +583,9 @@ class Trader:
         position: Dict[str, int],
         result: Dict[str, List[Order]],
         used: Dict[str, Dict[str, int]],
-        cap_scale: float = 1.0,
     ) -> None:
         if self.HYDRO_SWING_ENABLED:
-            self._trade_hydro_swing(product, book, memory, position, result, used, cap_scale=cap_scale)
+            self._trade_hydro_swing(product, book, memory, position, result, used)
             return
 
         pos = position.get(product, 0)
@@ -601,28 +704,25 @@ class Trader:
         position: Dict[str, int],
         result: Dict[str, List[Order]],
         used: Dict[str, Dict[str, int]],
-        cap_scale: float = 1.0,
     ) -> None:
         pos = position.get(product, 0)
-        cap = max(1, int(self.HYDRO_SWING_CAP * cap_scale))
+        cap = self.HYDRO_SWING_CAP
         size = self.HYDRO_SWING_SIZE
-        # Taper entry size as inventory builds; exits always use full size
-        entry_size = max(8, int(size * max(0.5, 1.0 - 0.5 * abs(pos) / max(cap, 1))))
+        bias = self._mark_bias(memory, product)
+        mirror_shift = self._mirror_hydro_shift(memory)
 
-        # Change 6: adaptive thresholds from HP EMA
-        hp_item = memory.get("hp_ema", {})
-        hp_count = int(hp_item.get("count", 0))
-        if hp_count < self.HYDRO_EMA_BOOTSTRAP_TICKS:
-            ema = self.HYDRO_EMA_HIST_MEAN
-        else:
-            ema = float(hp_item.get("mid", self.HYDRO_EMA_HIST_MEAN))
-        long_entry  = ema + self.HYDRO_LONG_ENTRY_OFFSET
-        long_exit   = ema + self.HYDRO_LONG_EXIT_OFFSET
-        short_entry = ema + self.HYDRO_SHORT_ENTRY_OFFSET
-        short_exit  = ema + self.HYDRO_SHORT_EXIT_OFFSET
-
+        long_entry = self.HYDRO_LONG_ENTRY + 3.0 * bias + mirror_shift
+        long_exit = self.HYDRO_LONG_EXIT + 2.0 * bias + mirror_shift
+        short_entry = self.HYDRO_SHORT_ENTRY + 3.0 * bias + mirror_shift
+        short_exit = self.HYDRO_SHORT_EXIT + 2.0 * bias + mirror_shift
         if pos > 0 and book["best_bid"] >= long_exit:
             sell_qty = min(pos, book["bid_vol"], size)
+            self._add_order(
+                product, book["best_bid"], -sell_qty, position, result, used,
+                long_cap_override=cap, short_cap_override=cap,
+            )
+        elif pos > self.HYDRO_SCALE_OUT_POS and book["best_bid"] >= long_entry + self.HYDRO_SCALE_OUT_EDGE:
+            sell_qty = min(pos - self.HYDRO_SCALE_OUT_POS, book["bid_vol"], self.HYDRO_SCALE_OUT_SIZE)
             self._add_order(
                 product, book["best_bid"], -sell_qty, position, result, used,
                 long_cap_override=cap, short_cap_override=cap,
@@ -634,12 +734,18 @@ class Trader:
                 product, book["best_ask"], buy_qty, position, result, used,
                 long_cap_override=cap, short_cap_override=cap,
             )
+        elif pos < -self.HYDRO_SCALE_OUT_POS and book["best_ask"] <= short_entry - self.HYDRO_SCALE_OUT_EDGE:
+            buy_qty = min(-self.HYDRO_SCALE_OUT_POS - pos, book["ask_vol"], self.HYDRO_SCALE_OUT_SIZE)
+            self._add_order(
+                product, book["best_ask"], buy_qty, position, result, used,
+                long_cap_override=cap, short_cap_override=cap,
+            )
 
         projected = pos + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
 
         if book["best_ask"] <= long_entry and projected < cap:
             buy_room = cap - projected
-            buy_qty = min(buy_room, book["ask_vol"], entry_size)
+            buy_qty = min(buy_room, book["ask_vol"], size)
             self._add_order(
                 product, book["best_ask"], buy_qty, position, result, used,
                 long_cap_override=cap, short_cap_override=cap,
@@ -649,9 +755,33 @@ class Trader:
 
         if book["best_bid"] >= short_entry and projected > -cap:
             sell_room = cap + projected
-            sell_qty = min(sell_room, book["bid_vol"], entry_size)
+            sell_qty = min(sell_room, book["bid_vol"], size)
             self._add_order(
                 product, book["best_bid"], -sell_qty, position, result, used,
+                long_cap_override=cap, short_cap_override=cap,
+            )
+
+        projected = pos + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
+        if (
+            projected < cap
+            and book["best_bid"] < book["best_ask"] - 1
+            and book["mid"] <= self.HYDRO_PASSIVE_LOW + mirror_shift
+        ):
+            buy_qty = min(self.HYDRO_PASSIVE_SIZE, cap - projected)
+            self._add_order(
+                product, book["best_bid"] + 1, buy_qty, position, result, used,
+                long_cap_override=cap, short_cap_override=cap,
+            )
+
+        projected = pos + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
+        if (
+            projected > -cap
+            and book["best_bid"] < book["best_ask"] - 1
+            and book["mid"] >= self.HYDRO_PASSIVE_HIGH + mirror_shift
+        ):
+            sell_qty = min(self.HYDRO_PASSIVE_SIZE, cap + projected)
+            self._add_order(
+                product, book["best_ask"] - 1, -sell_qty, position, result, used,
                 long_cap_override=cap, short_cap_override=cap,
             )
 
@@ -663,49 +793,40 @@ class Trader:
         position: Dict[str, int],
         result: Dict[str, List[Order]],
         used: Dict[str, Dict[str, int]],
-        cap_scale: float = 1.0,
     ) -> None:
-        offsets = self.PRICE_SWING_OFFSETS[product]
-        swing_item = memory.get("swing_ema", {}).get(product, {})
-        count = int(swing_item.get("count", 0))
+        long_entry, long_exit, short_entry, short_exit, cap, levels = self.PRICE_SWING_CONFIG[product]
+        bias = self._mark_bias(memory, product)
+        mirror_shift = self._mirror_price_shift(memory, product)
 
-        if count < self.SWING_EMA_BOOTSTRAP:
-            # Use hardcoded fallback before EMA has converged
-            le, lx, se, sx, cap_base, levels = self.PRICE_SWING_FALLBACK[product]
-            cap = max(1, int(cap_base * cap_scale))
-        else:
-            ema = float(swing_item["mid"])
-            le = ema + offsets["long_entry"]
-            lx = ema + offsets["long_exit"]
-            se = ema + offsets["short_entry"]
-            sx = ema + offsets["short_exit"]
-            cap = max(1, int(offsets["cap"] * cap_scale))
-            levels = offsets["levels"]
+        long_entry_adj = long_entry + 1.5 * bias + mirror_shift
+        long_exit_adj = long_exit + 0.8 * bias + mirror_shift
+        short_entry_adj = short_entry + 1.5 * bias + mirror_shift
+        short_exit_adj = short_exit + 0.8 * bias + mirror_shift
 
         pos = position.get(product, 0)
 
         if pos > 0:
             self._take_book_levels(
-                product, book, "sell", min(pos, cap), lx, levels,
+                product, book, "sell", min(pos, cap), long_exit_adj, levels,
                 position, result, used, cap, cap,
             )
         if pos < 0:
             self._take_book_levels(
-                product, book, "buy", min(-pos, cap), sx, levels,
+                product, book, "buy", min(-pos, cap), short_exit_adj, levels,
                 position, result, used, cap, cap,
             )
 
         projected = pos + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
         if projected < cap:
             self._take_book_levels(
-                product, book, "buy", cap - projected, le, levels,
+                product, book, "buy", cap - projected, long_entry_adj, levels,
                 position, result, used, cap, cap,
             )
 
         projected = pos + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
         if projected > -cap:
             self._take_book_levels(
-                product, book, "sell", cap + projected, se, levels,
+                product, book, "sell", cap + projected, short_entry_adj, levels,
                 position, result, used, cap, cap,
             )
 
@@ -769,10 +890,9 @@ class Trader:
         position: Dict[str, int],
         result: Dict[str, List[Order]],
         used: Dict[str, Dict[str, int]],
-        cap_scale: float = 1.0,
     ) -> None:
-        long_cap = max(0, int(self.TIME_VALUE_LONG_CAP.get(product, 0) * cap_scale))
-        short_cap = max(0, int(self.TIME_VALUE_SHORT_CAP.get(product, 0) * cap_scale))
+        long_cap = self.TIME_VALUE_LONG_CAP.get(product, 0)
+        short_cap = self.TIME_VALUE_SHORT_CAP.get(product, 0)
         if long_cap <= 0 and short_cap <= 0:
             return
 
@@ -780,16 +900,17 @@ class Trader:
         strike = self.STRIKES[product]
         intrinsic = max(spot_mid - strike, 0.0)
         mean, std = self._adaptive_tv_stats(memory, product)
+        entry_z = self.TIME_VALUE_ENTRY_Z[product]
+        short_entry_z = self.TIME_VALUE_SHORT_ENTRY_Z[product]
         item = memory.get("products", {}).get(product, {})
         tv_count = int(item.get("tv_count", 0))
+        bias = self._mark_bias(memory, product)
+        otm_sell_bias = float(item.get("otm_sell_bias", 0.0))
 
-        # Adaptive z: scale by (live_std / prior_std)^0.3 so calmer regimes
-        # tighten bands (more trades) and volatile regimes widen them (fewer whipsaws).
-        prior_std = self.TIME_VALUE_STD[product]
-        live_std_raw = math.sqrt(max(1e-6, float(item.get("tv_var", prior_std ** 2))))
-        vol_z_scale = max(0.4, min(2.5, live_std_raw / prior_std)) ** 0.3
-        entry_z = self.TIME_VALUE_ENTRY_Z[product] * vol_z_scale
-        short_entry_z = self.TIME_VALUE_SHORT_ENTRY_Z[product] * vol_z_scale
+        # Shift the time-value center conservatively using counterparty flow.
+        mean += 0.45 * bias
+        if product == "VEV_5300":
+            mean -= 0.35 * otm_sell_bias
 
         long_entry_tv = mean - entry_z * std
         short_entry_tv = mean + short_entry_z * std
@@ -859,97 +980,115 @@ class Trader:
             short_cap_override=short_cap,
         )
 
-    def _trade_fly_5300_5400_5500(
-        self,
-        books: Dict[str, Any],
-        position: Dict[str, int],
-        memory: Dict[str, Any],
-        result: Dict[str, List[Order]],
-        used: Dict[str, Dict[str, int]],
-        max_qty: int = 100,
-    ) -> None:
-        fv = (books["VEV_5300"]["mid"]
-              - 2.0 * books["VEV_5400"]["mid"]
-              + books["VEV_5500"]["mid"])
-
-        # Update EWMA stats
-        fly_mem = memory.setdefault("fly_5300_5400_5500", {
-            "mean": self.FLY_5300_5400_5500_MEAN_PRIOR,
-            "var": self.FLY_5300_5400_5500_STD_PRIOR ** 2,
-            "count": 0,
-        })
-        a = self.FLY_EWMA_ALPHA
-        old_mean = float(fly_mem["mean"])
-        old_var  = float(fly_mem["var"])
-        new_mean = (1.0 - a) * old_mean + a * fv
-        diff = fv - old_mean
-        new_var = (1.0 - a) * old_var + a * diff * diff
-        fly_mem["mean"] = new_mean
-        fly_mem["var"]  = max(new_var, 1e-6)
-        fly_mem["count"] = int(fly_mem.get("count", 0)) + 1
-
-        # Blend live EWMA with historical prior
-        w = self.FLY_PRIOR_W
-        blended_mean = w * self.FLY_5300_5400_5500_MEAN_PRIOR + (1.0 - w) * new_mean
-        blended_std  = max(
-            w * self.FLY_5300_5400_5500_STD_PRIOR,
-            math.sqrt(max(1e-6, new_var)),
+        self._trade_tv_satellite(
+            product, book, intrinsic, memory, position, result, used, long_cap, short_cap
         )
 
-        z = (fv - blended_mean) / max(blended_std, 1e-6)
-        fly_pos = int(memory.get("fly_pos", 0))
+    def _trade_tv_satellite(
+        self,
+        product: str,
+        book: Dict[str, Any],
+        intrinsic: float,
+        memory: Dict[str, Any],
+        position: Dict[str, int],
+        result: Dict[str, List[Order]],
+        used: Dict[str, Dict[str, int]],
+        long_cap: int,
+        short_cap: int,
+    ) -> None:
+        cfg = self.TV_SATELLITE_CONFIG.get(product)
+        if cfg is None:
+            return
+        core_pos, min_hold, bias_room, sell_edge, buy_edge, clip = cfg
+        item = memory.get("products", {}).get(product, {})
+        if int(item.get("long_hold_ticks", 0)) < min_hold:
+            return
 
-        if z > self.FLY_ENTRY_Z:
-            target_fly_pos = -max_qty   # fly expensive: sell wings, buy body
-        elif z < -self.FLY_ENTRY_Z:
-            target_fly_pos = max_qty    # fly cheap: buy wings, sell body
-        elif abs(z) < self.FLY_EXIT_Z and fly_pos != 0:
-            target_fly_pos = 0          # near mean: exit
-        else:
-            target_fly_pos = fly_pos    # hold
+        prior_mean = self.TIME_VALUE_MEAN[product]
+        prior_std = self.TIME_VALUE_STD[product]
+        live_mean = float(item.get("tv_cycle_mean", prior_mean))
+        live_std = math.sqrt(max(1e-6, float(item.get("tv_cycle_var", prior_std * prior_std))))
+        tv_count = int(item.get("tv_count", 0))
+        if tv_count < self.TV_MATURE_COUNT:
+            return
+        flow_bias = float(item.get("otm_sell_bias", 0.0))
+        flow_push = max(-bias_room, min(bias_room, flow_bias))
+        if live_mean >= prior_mean - 0.25 * prior_std and flow_push < 0.75:
+            return
 
-        diff_qty = target_fly_pos - fly_pos
-        size = max(-self.FLY_LEG_SIZE, min(self.FLY_LEG_SIZE, diff_qty))
+        bid_tv = book["best_bid"] - intrinsic
+        ask_tv = book["best_ask"] - intrinsic
+        projected = position.get(product, 0) + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
 
-        if size != 0:
-            leg = abs(size)
-            if size > 0:
-                # Buy wings (5300 + 5500 cheap): buy 5300, sell 2x5400, buy 5500
-                self._take_book_levels(
-                    "VEV_5300", books["VEV_5300"], "buy", leg,
-                    books["VEV_5300"]["best_ask"], 1,
-                    position, result, used, 300, 300,
-                )
-                self._take_book_levels(
-                    "VEV_5400", books["VEV_5400"], "sell", 2 * leg,
-                    books["VEV_5400"]["best_bid"], 1,
-                    position, result, used, 300, 300,
-                )
-                self._take_book_levels(
-                    "VEV_5500", books["VEV_5500"], "buy", leg,
-                    books["VEV_5500"]["best_ask"], 1,
-                    position, result, used, 300, 300,
-                )
-            else:
-                # Sell wings (5300 + 5500 expensive): sell 5300, buy 2x5400, sell 5500
-                self._take_book_levels(
-                    "VEV_5300", books["VEV_5300"], "sell", leg,
-                    books["VEV_5300"]["best_bid"], 1,
-                    position, result, used, 300, 300,
-                )
-                self._take_book_levels(
-                    "VEV_5400", books["VEV_5400"], "buy", 2 * leg,
-                    books["VEV_5400"]["best_ask"], 1,
-                    position, result, used, 300, 300,
-                )
-                self._take_book_levels(
-                    "VEV_5500", books["VEV_5500"], "sell", leg,
-                    books["VEV_5500"]["best_bid"], 1,
-                    position, result, used, 300, 300,
-                )
-            memory["fly_pos"] = fly_pos + size
+        dynamic_core = core_pos
+        dynamic_core -= int(round(28.0 * max(flow_push, 0.0)))
+        dynamic_core += int(round(12.0 * max(-flow_push, 0.0)))
+        dynamic_core = max(120, min(long_cap - clip, dynamic_core))
 
-    # ── execution helpers ─────────────────────────────────────────────────────
+        upper = live_mean + max(0.35, 0.55 * live_std, sell_edge - 0.15 * max(flow_push, 0.0))
+        lower = live_mean - max(0.25, 0.45 * live_std, buy_edge + 0.10 * max(flow_push, 0.0))
+
+        if projected > dynamic_core and bid_tv >= upper:
+            sell_qty = min(clip, projected - dynamic_core, book["bid_vol"])
+            if sell_qty > 0:
+                self._add_order(
+                    product, book["best_bid"], -sell_qty,
+                    position, result, used,
+                    long_cap_override=long_cap,
+                    short_cap_override=short_cap,
+                )
+
+        projected = position.get(product, 0) + used.get(product, {}).get("buy", 0) - used.get(product, {}).get("sell", 0)
+        if projected >= dynamic_core and projected < long_cap and ask_tv <= lower:
+            buy_qty = min(clip, long_cap - projected, book["ask_vol"])
+            if buy_qty > 0:
+                self._add_order(
+                    product, book["best_ask"], buy_qty,
+                    position, result, used,
+                    long_cap_override=long_cap,
+                    short_cap_override=short_cap,
+                )
+
+    def _trade_tv_surface_rotation(
+        self,
+        books: Dict[str, Dict[str, Any]],
+        spot_mid: float,
+        memory: Dict[str, Any],
+        position: Dict[str, int],
+        result: Dict[str, List[Order]],
+        used: Dict[str, Dict[str, int]],
+    ) -> None:
+        if "VEV_5300" not in books or "VEV_5400" not in books:
+            return
+        left_item = memory.get("products", {}).get("VEV_5300", {})
+        right_item = memory.get("products", {}).get("VEV_5400", {})
+        if min(int(left_item.get("long_hold_ticks", 0)), int(right_item.get("long_hold_ticks", 0))) < self.TV_SURFACE_MIN_HOLD:
+            return
+
+        surface = memory.get("surface", {})
+        count = int(surface.get("vev_5300_5400_count", 0))
+        if count < self.TV_SURFACE_MIN_COUNT:
+            return
+
+        mean = float(surface.get("vev_5300_5400_mean", 0.0))
+        std = math.sqrt(max(1e-6, float(surface.get("vev_5300_5400_var", 16.0))))
+        edge = max(self.TV_SURFACE_EDGE_FLOOR, self.TV_SURFACE_STD_MULT * std)
+
+        left_tv = books["VEV_5300"]["best_bid"] - max(spot_mid - self.STRIKES["VEV_5300"], 0.0)
+        right_tv = books["VEV_5400"]["best_bid"] - max(spot_mid - self.STRIKES["VEV_5400"], 0.0)
+        spread = left_tv - right_tv
+
+        if spread >= mean + edge:
+            projected = position.get("VEV_5300", 0) + used.get("VEV_5300", {}).get("buy", 0) - used.get("VEV_5300", {}).get("sell", 0)
+            core = self.TV_SURFACE_CORE["VEV_5300"]
+            sell_qty = min(self.TV_SURFACE_CLIP, max(0, projected - core), books["VEV_5300"]["bid_vol"])
+            if sell_qty > 0:
+                self._add_order(
+                    "VEV_5300", books["VEV_5300"]["best_bid"], -sell_qty,
+                    position, result, used,
+                    long_cap_override=self.TIME_VALUE_LONG_CAP["VEV_5300"],
+                    short_cap_override=self.TIME_VALUE_SHORT_CAP["VEV_5300"],
+                )
 
     def _take_book_levels(
         self,
@@ -957,7 +1096,7 @@ class Trader:
         book: Dict[str, Any],
         side: str,
         qty: int,
-        limit_price,
+        limit_price: float,
         levels: int,
         position: Dict[str, int],
         result: Dict[str, List[Order]],
@@ -1129,56 +1268,3 @@ class Trader:
             product_used["sell"] += sell_qty
 
         result.setdefault(product, []).append(Order(product, int(price), int(qty)))
-
-
-if __name__ == "__main__":
-    import sys
-
-    class _Depth:
-        def __init__(self, bids, asks):
-            self.buy_orders = bids
-            self.sell_orders = {p: -v for p, v in asks.items()}
-
-    class _State:
-        def __init__(self, ts, td, pos, depths):
-            self.timestamp = ts
-            self.traderData = td
-            self.position = dict(pos)
-            self.order_depths = depths
-
-    def _make_depths():
-        return {
-            "HYDROGEL_PACK":       _Depth({9979: 50, 9975: 30}, {9981: 50, 9985: 30}),
-            "VELVETFRUIT_EXTRACT": _Depth({5259: 50, 5255: 30}, {5261: 50, 5265: 30}),
-            "VEV_4000":            _Depth({1261: 50},           {1263: 50}),
-            "VEV_4500":            _Depth({765: 50},            {767: 50}),
-            "VEV_5000":            _Depth({267: 50},            {270: 50}),
-            "VEV_5100":            _Depth({178: 50},            {181: 50}),
-            "VEV_5200":            _Depth({92: 50},             {95: 50}),
-            "VEV_5300":            _Depth({46: 50, 45: 30},     {48: 50, 49: 30}),
-            "VEV_5400":            _Depth({15: 50, 14: 30},     {17: 50, 18: 30}),
-            "VEV_5500":            _Depth({6: 50, 5: 30},       {8: 50, 9: 30}),
-        }
-
-    try:
-        trader = Trader()
-        td = ""
-        pos: Dict[str, int] = {}
-
-        for i in range(5):
-            state = _State(i * 10000, td, pos, _make_depths())
-            orders, conv, td = trader.run(state)
-
-        mem = json.loads(td)
-        assert "products" in mem, "missing: products"
-        assert "fly_5300_5400_5500" in mem, "missing: fly_5300_5400_5500"
-        assert "hp_ema" in mem, "missing: hp_ema"
-        assert "swing_ema" in mem, "missing: swing_ema"
-        assert json.loads(json.dumps(mem)) == mem, "traderData json round-trip failed"
-
-        print("TRADER OK")
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        print(f"TRADER FAILED: {exc}")
-        sys.exit(1)
