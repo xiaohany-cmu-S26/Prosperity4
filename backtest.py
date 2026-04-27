@@ -56,7 +56,7 @@ from datamodel import (
 # ── Position limits (mirrors Rust backtester's hardcoded table) ───────────────
 
 KNOWN_POSITION_LIMITS: Dict[str, int] = {
-    # Round 3
+    # Round 3 / 4
     "HYDROGEL_PACK": 200,
     "VELVETFRUIT_EXTRACT": 200,
     "VEV_4000": 300,
@@ -750,9 +750,10 @@ def run_backtest(
 
     os.environ["PROSPERITY4BT_ROUND"] = str(round_num)
     os.environ["PROSPERITY4BT_DAY"] = str(day_num)
-    # Round 3 historical data: day_0 = TTE8 (tutorial), day_1 = TTE7 (R1), day_2 = TTE6 (R2).
-    # The live Round 3 submission starts at TTE5, so this env var is absent there.
-    if round_num == 3:
+    # Round 3/4 historical data uses TTE formula: TTE = 8 - day_num.
+    # Round 3: day_0=TTE8 (tutorial), day_1=TTE7 (R1), day_2=TTE6 (R2); live R3 starts TTE5.
+    # Round 4: day_1=TTE7 (R1), day_2=TTE6 (R2), day_3=TTE5 (R3); live R4 starts TTE4.
+    if round_num in (3, 4):
         os.environ["PROSPERITY4BT_TTE_START"] = str(8 - day_num)
     else:
         os.environ.pop("PROSPERITY4BT_TTE_START", None)
@@ -1045,9 +1046,9 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="ROUND_3",
+        default="ROUND_4",
         help=(
-            "Path to data directory (default: ROUND_3). "
+            "Path to data directory (default: ROUND_4). "
             "Also accepts prosperity_rust_backtester-main/datasets for the "
             "bundled Rust backtester datasets."
         ),
@@ -1055,8 +1056,8 @@ def main():
     parser.add_argument(
         "--round",
         type=int,
-        default=3,
-        help="Round number (default: 3)",
+        default=4,
+        help="Round number (default: 4)",
     )
     parser.add_argument(
         "--day",
