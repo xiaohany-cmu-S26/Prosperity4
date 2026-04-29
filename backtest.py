@@ -56,6 +56,26 @@ from datamodel import (
 # ── Position limits (mirrors Rust backtester's hardcoded table) ───────────────
 
 KNOWN_POSITION_LIMITS: Dict[str, int] = {
+    # Round 5 — 10 categories × 5 variants. All round-5 products share a hard
+    # position limit of 10 per IMC's round-5 brief.
+    **{f"PEBBLES_{s}": 10 for s in ("XS", "S", "M", "L", "XL")},
+    **{f"MICROCHIP_{s}": 10 for s in ("CIRCLE", "OVAL", "RECTANGLE", "SQUARE", "TRIANGLE")},
+    **{f"GALAXY_SOUNDS_{s}": 10 for s in (
+        "BLACK_HOLES", "DARK_MATTER", "PLANETARY_RINGS", "SOLAR_FLAMES", "SOLAR_WINDS"
+    )},
+    **{f"OXYGEN_SHAKE_{s}": 10 for s in (
+        "CHOCOLATE", "EVENING_BREATH", "GARLIC", "MINT", "MORNING_BREATH"
+    )},
+    **{f"PANEL_{s}": 10 for s in ("1X2", "1X4", "2X2", "2X4", "4X4")},
+    **{f"ROBOT_{s}": 10 for s in ("DISHES", "IRONING", "LAUNDRY", "MOPPING", "VACUUMING")},
+    **{f"SLEEP_POD_{s}": 10 for s in ("COTTON", "LAMB_WOOL", "NYLON", "POLYESTER", "SUEDE")},
+    **{f"SNACKPACK_{s}": 10 for s in (
+        "CHOCOLATE", "PISTACHIO", "RASPBERRY", "STRAWBERRY", "VANILLA"
+    )},
+    **{f"TRANSLATOR_{s}": 10 for s in (
+        "ASTRO_BLACK", "ECLIPSE_CHARCOAL", "GRAPHITE_MIST", "SPACE_GRAY", "VOID_BLUE"
+    )},
+    **{f"UV_VISOR_{s}": 10 for s in ("AMBER", "MAGENTA", "ORANGE", "RED", "YELLOW")},
     # Round 3 / 4
     "HYDROGEL_PACK": 200,
     "VELVETFRUIT_EXTRACT": 200,
@@ -745,6 +765,7 @@ def run_backtest(
     default_limit: int,
     print_output: bool,
     config: MatchingConfig,
+    max_timestamps: Optional[int],
 ) -> BacktestResult:
     data = read_day_data(data_dir, round_num, day_num)
 
@@ -773,6 +794,8 @@ def run_backtest(
     result = BacktestResult(round_num=round_num, day_num=day_num)
 
     timestamps = sorted(data.prices.keys())
+    if max_timestamps is not None and max_timestamps > 0:
+        timestamps = timestamps[:max_timestamps]
     total = len(timestamps)
 
     for i, timestamp in enumerate(timestamps):
@@ -1058,9 +1081,9 @@ def main():
     parser.add_argument(
         "--data",
         type=str,
-        default="ROUND_4",
+        default="ROUND_5",
         help=(
-            "Path to data directory (default: ROUND_4). "
+            "Path to data directory (default: ROUND_5). "
             "Also accepts prosperity_rust_backtester-main/datasets for the "
             "bundled Rust backtester datasets."
         ),
@@ -1068,8 +1091,8 @@ def main():
     parser.add_argument(
         "--round",
         type=int,
-        default=4,
-        help="Round number (default: 4)",
+        default=5,
+        help="Round number (default: 5)",
     )
     parser.add_argument(
         "--day",
@@ -1112,6 +1135,12 @@ def main():
         "--merge-pnl",
         action="store_true",
         help="Merge profit and loss across days",
+    )
+    parser.add_argument(
+        "--max-timestamps",
+        type=int,
+        default=None,
+        help="Limit the run to the first N timestamps",
     )
     parser.add_argument(
         "--print",
@@ -1193,6 +1222,7 @@ def main():
             default_limit,
             args.print_output,
             config,
+            args.max_timestamps,
         )
 
         print_day_summary(result)
