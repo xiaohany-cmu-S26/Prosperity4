@@ -128,6 +128,14 @@ SP_SKEW_TIERS    = [(3, 0.5), (5, 1.5), (7, 3.0), (9, 6.0)]
 SP_PAIR_ALPHA    = 0.01
 SP_PAIR_THRESH   = 30
 SP_PAIR_COEF     = 0.30
+# SNACKPACK basket-FV guard: rolling-mean reference (~200-tick decay) for
+# the 5-leg sum. When current sum deviates beyond SP_BASKET_THRESH, suppress
+# the side of inside-quote that would trade against the implied fair.
+# CV 0.38% / sum-return AR(1) -0.227 makes this category mean-revert cleanly
+# enough to guard, like PEBBLES (which uses a hard 50,000 identity instead).
+SP_BASKET_ALPHA  = 0.005
+SP_BASKET_THRESH = 100
+SP_BASKET_BOUND  = 500
 RASP_FV_FAST_A   = 0.10
 RASP_FV_SLOW_A   = 0.005
 RASP_BLEND       = 0.50
@@ -172,6 +180,13 @@ class Trader:
                 SP_PAIR_ALPHA * pair_sum + (1.0 - SP_PAIR_ALPHA) * prev
             )
 
+        if all(p in books for p in SNACKPACKS):
+            sp_sum = sum(books[p]["mid"] for p in SNACKPACKS)
+            prev = memory.get("sp_basket_ema")
+            memory["sp_basket_ema"] = sp_sum if prev is None else (
+                SP_BASKET_ALPHA * sp_sum + (1.0 - SP_BASKET_ALPHA) * prev
+            )
+
         # Phase 3 — group dispatch (PEBBLES basket fires once per tick)
         if all(p in books for p in PEBBLES):
             self._trade_pebbles(books, state.position, result, used)
@@ -191,7 +206,7 @@ class Trader:
             elif strat == "vanilla_mm":
                 self._trade_vanilla(product, book, memory, cfg, state.position, result, used)
             elif strat == "inside_quote_mm":
-                self._trade_inside_quote(product, book, books, cfg, state.position, result, used)
+                self._trade_inside_quote(product, book, books, memory, cfg, state.position, result, used)
 
         tick = memory.get("tick", 0)
         day_ts = state.timestamp % 1_000_000
@@ -342,7 +357,7 @@ class Trader:
 
     # ────────────── Strategy: inside-quote market making ──────────────────────
 
-    def _trade_inside_quote(self, product, book, books, cfg, position, result, used):
+    def _trade_inside_quote(self, product, book, books, memory, cfg, position, result, used):
         spread = book["spread"]
         if spread <= 1:
             return
@@ -369,6 +384,17 @@ class Trader:
                 basket_dev = sum(books[p]["mid"] for p in PEBBLES) - BASKET_TARGET_SUM
                 if abs(basket_dev) <= 200:
                     implied_fair = book["mid"] - basket_dev
+                    if my_bid > implied_fair:
+                        allow_buy = False
+                    if my_ask < implied_fair:
+                        allow_sell = False
+        elif product in SNACKPACKS:
+            sp_ema = memory.get("sp_basket_ema")
+            if sp_ema is not None and all(p in books for p in SNACKPACKS):
+                sp_sum = sum(books[p]["mid"] for p in SNACKPACKS)
+                sum_dev = sp_sum - sp_ema
+                if SP_BASKET_THRESH < abs(sum_dev) <= SP_BASKET_BOUND:
+                    implied_fair = book["mid"] - sum_dev
                     if my_bid > implied_fair:
                         allow_buy = False
                     if my_ask < implied_fair:

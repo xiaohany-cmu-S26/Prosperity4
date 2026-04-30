@@ -586,6 +586,53 @@ def _eligible_trade_price(
     return False
 
 
+def liquidate_end_of_day(
+    state: TradingState,
+    data: BacktestData,
+    result: BacktestResult,
+    last_timestamp: int,
+) -> None:
+    """Flatten residual position at last-tick mid so PnL is realized at fair
+    value rather than carried into the next day.
+
+    Appends synthetic SUBMISSION trades at the last timestamp, updates the
+    cash bookkeeping in data.profit_loss, and rewrites the final-timestamp
+    activity-log rows so their PnL column reflects the realized cash (which
+    also picks up any edge from trades that occurred at last_timestamp itself,
+    since those rows were written before that timestamp's match ran).
+    """
+    last_prices = data.prices.get(last_timestamp, {})
+    for product, position in list(state.position.items()):
+        if position == 0:
+            continue
+        row = last_prices.get(product)
+        if row is None:
+            continue
+        mid = row.mid_price
+        # Cash uses the (possibly fractional) mid so realized PnL exactly
+        # equals the previous mark-to-market valuation at this mid.
+        data.profit_loss[product] += position * mid
+        liq_price = int(round(mid))
+        if position > 0:
+            result.trades.append(TradeRow(Trade(
+                product, liq_price, position,
+                "", "SUBMISSION", last_timestamp,
+            )))
+        else:
+            result.trades.append(TradeRow(Trade(
+                product, liq_price, -position,
+                "SUBMISSION", "", last_timestamp,
+            )))
+        state.position[product] = 0
+
+    for i in range(len(result.activity_logs) - 1, -1, -1):
+        row = result.activity_logs[i]
+        if row.timestamp != last_timestamp:
+            break
+        product = row.columns[2]
+        row.columns[-1] = data.profit_loss.get(product, 0.0)
+
+
 def match_orders(
     state: TradingState,
     data: BacktestData,
@@ -837,6 +884,9 @@ def run_backtest(
                 end="",
                 flush=True,
             )
+
+    if timestamps:
+        liquidate_end_of_day(state, data, result, timestamps[-1])
 
     print()
     return result
