@@ -1,0 +1,2 @@
+logs/backtest_trading.json filter=lfs diff=lfs merge=lfs -text
+logs/backtest_trading.log filter=lfs diff=lfs merge=lfs -text
